@@ -1,243 +1,1318 @@
-import { jest } from '@jest/globals';
-import fs from 'fs/promises';
-import path from 'path';
+import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
+import path from "path";
+import os from "os";
 
-// Mock the MCP SDK
-jest.mock('@modelcontextprotocol/sdk/server/index.js');
-jest.mock('@modelcontextprotocol/sdk/server/stdio.js');
-jest.mock('@google/generative-ai');
-
-const mockGenerateContent = jest.fn() as jest.MockedFunction<any>;
-const mockGetGenerativeModel = jest.fn().mockReturnValue({
-  generateContent: mockGenerateContent,
-}) as jest.MockedFunction<any>;
-
-const MockGoogleGenerativeAI = jest.fn().mockImplementation(() => ({
-  getGenerativeModel: mockGetGenerativeModel,
-})) as jest.MockedFunction<any>;
-
-// Override the import
-jest.unstable_mockModule('@google/generative-ai', () => ({
-  GoogleGenerativeAI: MockGoogleGenerativeAI,
+// Hoist mock fn references so vi.mock factories can close over them
+const { mockGenerateContent } = vi.hoisted(() => ({
+  mockGenerateContent: vi.fn(),
 }));
 
-describe('Nano-banana MCP Server', () => {
+// Use regular functions (not arrow functions) so they work as constructors with `new`
+vi.mock("@modelcontextprotocol/sdk/server/index.js", () => ({
+  Server: vi.fn(function(this: any) {
+    this.setRequestHandler = vi.fn();
+    this.connect = vi.fn().mockResolvedValue(undefined);
+  }),
+}));
+
+vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
+  StdioServerTransport: vi.fn(function(this: any) {}),
+}));
+
+vi.mock("@google/genai", () => ({
+  GoogleGenAI: vi.fn(function(this: any) {
+    this.models = { generateContent: mockGenerateContent };
+  }),
+}));
+
+vi.mock("fs/promises");
+
+import * as fs from "fs/promises";
+import {
+  Logger,
+  classifyApiError,
+  ConfigSchema,
+  CONSTANTS,
+  NanoBananaMCP,
+} from "../index.js";
+import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
+
+// Helper: build a fake CallToolRequest
+function fakeRequest(toolName: string, args: Record<string, unknown> = {}) {
+  return { params: { name: toolName, arguments: args } } as any;
+}
+
+// Helper: directly call handleSearch on the server (bypasses MCP dispatch)
+function callSearch(server: NanoBananaMCP, args: Record<string, unknown> = {}) {
+  return (server as any).handleSearch(fakeRequest("search", args));
+}
+
+// Helper: directly call handleExecute
+async function callExecute(server: NanoBananaMCP, operation: string, args: Record<string, unknown> = {}) {
+  return (server as any).handleExecute(
+    fakeRequest("execute", { operation, arguments: args })
+  );
+}
+
+// Helper: set private config + genAI on server
+function configureServer(server: NanoBananaMCP, overrides: Record<string, unknown> = {}) {
+  const config = {
+    geminiApiKey: "test-key",
+    model: CONSTANTS.MODEL,
+    outputFormat: "png",
+    timeoutMs: CONSTANTS.TIMEOUT_MS,
+    promptPrefix: "",
+    promptSuffix: "",
+    ...overrides,
+  };
+  (server as any).config = config;
+  (server as any).genAI = { models: { generateContent: mockGenerateContent } };
+  (server as any).configSource = "environment";
+}
+
+// Stub fs methods with sensible defaults (also clears all mock call history)
+function stubFsDefaults() {
+  vi.clearAllMocks();
+  vi.mocked(fs.mkdir).mockResolvedValue(undefined as any);
+  vi.mocked(fs.writeFile).mockResolvedValue(undefined as any);
+  vi.mocked(fs.readFile).mockRejectedValue(Object.assign(new Error("ENOENT"), { code: "ENOENT" }));
+  vi.mocked(fs.access).mockRejectedValue(Object.assign(new Error("ENOENT"), { code: "ENOENT" }));
+  vi.mocked(fs.unlink).mockResolvedValue(undefined as any);
+  vi.mocked(fs.stat).mockResolvedValue({ size: 102400, mtime: new Date("2025-01-01T00:00:00Z") } as any);
+  vi.mocked(fs.readdir).mockResolvedValue([] as any);
+}
+
+// -------------------------------------------------------------------
+// Logger
+// -------------------------------------------------------------------
+
+describe("Logger", () => {
+  let stderrSpy: ReturnType<typeof vi.spyOn>;
+
   beforeEach(() => {
-    jest.clearAllMocks();
+    stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
   });
 
-  describe('Configuration', () => {
-    test('should validate API key format', () => {
-      const validKey = 'AIzaSyC...';
-      const invalidKey = '';
-      
-      expect(validKey.length).toBeGreaterThan(0);
-      expect(invalidKey.length).toBe(0);
+  afterEach(() => {
+    stderrSpy.mockRestore();
+  });
+
+  it("defaults to WARN level when no override given and env not set", () => {
+    const logger = new Logger(undefined);
+    expect(logger.levelName).toBe("WARN");
+  });
+
+  it("accepts explicit level override", () => {
+    expect(new Logger("DEBUG").levelName).toBe("DEBUG");
+    expect(new Logger("INFO").levelName).toBe("INFO");
+    expect(new Logger("ERROR").levelName).toBe("ERROR");
+    expect(new Logger("SILENT").levelName).toBe("SILENT");
+  });
+
+  it("falls back to WARN for invalid level names", () => {
+    expect(new Logger("VERBOSE").levelName).toBe("WARN");
+    expect(new Logger("ALL").levelName).toBe("WARN");
+  });
+
+  it("writes to stderr for warn messages when level is WARN", () => {
+    const logger = new Logger("WARN");
+    logger.warn("test warning");
+    expect(stderrSpy).toHaveBeenCalledOnce();
+    expect(String(stderrSpy.mock.calls[0][0])).toContain("WARN");
+    expect(String(stderrSpy.mock.calls[0][0])).toContain("test warning");
+    expect(String(stderrSpy.mock.calls[0][0])).toContain("[nano-banana]");
+  });
+
+  it("includes metadata JSON when provided", () => {
+    const logger = new Logger("WARN");
+    logger.warn("msg", { key: "value" });
+    expect(String(stderrSpy.mock.calls[0][0])).toContain('{"key":"value"}');
+  });
+
+  it("suppresses debug messages when level is WARN", () => {
+    const logger = new Logger("WARN");
+    logger.debug("should not appear");
+    expect(stderrSpy).not.toHaveBeenCalled();
+  });
+
+  it("suppresses info messages when level is WARN", () => {
+    const logger = new Logger("WARN");
+    logger.info("should not appear");
+    expect(stderrSpy).not.toHaveBeenCalled();
+  });
+
+  it("writes debug, info, warn, error when level is DEBUG", () => {
+    const logger = new Logger("DEBUG");
+    logger.debug("d");
+    logger.info("i");
+    logger.warn("w");
+    logger.error("e");
+    expect(stderrSpy).toHaveBeenCalledTimes(4);
+  });
+
+  it("suppresses all output when level is SILENT", () => {
+    const logger = new Logger("SILENT");
+    logger.debug("d");
+    logger.info("i");
+    logger.warn("w");
+    logger.error("e");
+    expect(stderrSpy).not.toHaveBeenCalled();
+  });
+
+  it("writes error messages when level is ERROR", () => {
+    const logger = new Logger("ERROR");
+    logger.error("critical failure", { code: 500 });
+    expect(stderrSpy).toHaveBeenCalledOnce();
+    expect(String(stderrSpy.mock.calls[0][0])).toContain("ERROR");
+  });
+
+  it("does not write warn when level is ERROR", () => {
+    const logger = new Logger("ERROR");
+    logger.warn("not shown");
+    expect(stderrSpy).not.toHaveBeenCalled();
+  });
+});
+
+// -------------------------------------------------------------------
+// classifyApiError
+// -------------------------------------------------------------------
+
+describe("classifyApiError", () => {
+  it("passes through an existing McpError unchanged", () => {
+    const original = new McpError(ErrorCode.InvalidParams, "original");
+    expect(classifyApiError(original, "op")).toBe(original);
+  });
+
+  it("classifies timeout errors", () => {
+    const err = classifyApiError(new Error("Request timed out after 120000ms"), "generate_image");
+    expect(err.code).toBe(ErrorCode.InternalError);
+    expect(err.message).toContain("timed out");
+    expect(err.message).toContain("NANO_BANANA_TIMEOUT_MS");
+  });
+
+  it("classifies 429 / rate limit errors", () => {
+    const err = classifyApiError(new Error("429 Too Many Requests"), "generate_image");
+    expect(err.code).toBe(ErrorCode.InternalError);
+    expect(err.message).toContain("Rate limit");
+  });
+
+  it("classifies resource_exhausted errors", () => {
+    const err = classifyApiError(new Error("RESOURCE_EXHAUSTED quota exceeded"), "generate_image");
+    expect(err.message).toContain("Rate limit");
+  });
+
+  it("classifies 401 / invalid API key errors", () => {
+    const err = classifyApiError(new Error("API_KEY_INVALID: invalid api key"), "generate_image");
+    expect(err.code).toBe(ErrorCode.InvalidRequest);
+    expect(err.message).toContain("Invalid Gemini API key");
+    expect(err.message).toContain("configure_gemini_token");
+  });
+
+  it("classifies 403 / permission denied errors", () => {
+    const err = classifyApiError(new Error("PERMISSION_DENIED: billing not enabled"), "edit_image");
+    expect(err.code).toBe(ErrorCode.InvalidRequest);
+    expect(err.message).toContain("access denied");
+  });
+
+  it("classifies 404 / model not found errors", () => {
+    const err = classifyApiError(new Error("NOT_FOUND: model not found"), "generate_image");
+    expect(err.code).toBe(ErrorCode.InvalidRequest);
+    expect(err.message).toContain("model not found");
+    expect(err.message).toContain("NANO_BANANA_MODEL");
+  });
+
+  it("classifies 503 / unavailable errors", () => {
+    const err = classifyApiError(new Error("503 service unavailable"), "generate_image");
+    expect(err.code).toBe(ErrorCode.InternalError);
+    expect(err.message).toContain("temporarily unavailable");
+  });
+
+  it("classifies 500 / internal server errors", () => {
+    const err = classifyApiError(new Error("500 internal_error"), "generate_image");
+    expect(err.code).toBe(ErrorCode.InternalError);
+    expect(err.message).toContain("server error");
+  });
+
+  it("wraps unrecognised errors as generic InternalError", () => {
+    const err = classifyApiError(new Error("something weird happened"), "my_op");
+    expect(err.code).toBe(ErrorCode.InternalError);
+    expect(err.message).toContain("my_op failed");
+    expect(err.message).toContain("something weird happened");
+  });
+
+  it("handles non-Error objects", () => {
+    const err = classifyApiError("plain string error", "op");
+    expect(err.message).toContain("plain string error");
+  });
+
+  it("handles null", () => {
+    const err = classifyApiError(null, "op");
+    expect(err).toBeInstanceOf(McpError);
+  });
+});
+
+// -------------------------------------------------------------------
+// ConfigSchema
+// -------------------------------------------------------------------
+
+describe("ConfigSchema", () => {
+  it("parses a minimal config with defaults applied", () => {
+    const result = ConfigSchema.parse({ geminiApiKey: "my-key" });
+    expect(result.geminiApiKey).toBe("my-key");
+    expect(result.model).toBe(CONSTANTS.MODEL);
+    expect(result.outputFormat).toBe("png");
+    expect(result.timeoutMs).toBe(CONSTANTS.TIMEOUT_MS);
+    expect(result.promptPrefix).toBe("");
+    expect(result.promptSuffix).toBe("");
+  });
+
+  it("accepts all fields when provided", () => {
+    const result = ConfigSchema.parse({
+      geminiApiKey: "key",
+      model: "gemini-custom",
+      outputDir: "/tmp/imgs",
+      outputFormat: "webp",
+      timeoutMs: 60000,
+      promptPrefix: "ultra HD, ",
+      promptSuffix: ", masterpiece",
     });
+    expect(result.model).toBe("gemini-custom");
+    expect(result.outputDir).toBe("/tmp/imgs");
+    expect(result.outputFormat).toBe("webp");
+    expect(result.timeoutMs).toBe(60000);
+    expect(result.promptPrefix).toBe("ultra HD, ");
+    expect(result.promptSuffix).toBe(", masterpiece");
+  });
 
-    test('should handle configuration persistence', async () => {
-      const testConfig = {
-        geminiApiKey: 'test-api-key-123',
-      };
+  it("rejects empty geminiApiKey", () => {
+    expect(() => ConfigSchema.parse({ geminiApiKey: "" })).toThrow();
+  });
 
-      const configPath = path.join(process.cwd(), '.nano-banana-config.json');
-      
-      // Test writing config
-      await fs.writeFile(configPath, JSON.stringify(testConfig, null, 2));
-      
-      // Test reading config
-      const configData = await fs.readFile(configPath, 'utf-8');
-      const parsedConfig = JSON.parse(configData);
-      
-      expect(parsedConfig.geminiApiKey).toBe('test-api-key-123');
-      
-      // Cleanup
-      try {
-        await fs.unlink(configPath);
-      } catch {
-        // Ignore if file doesn't exist
-      }
+  it("rejects missing geminiApiKey", () => {
+    expect(() => ConfigSchema.parse({})).toThrow();
+  });
+
+  it("rejects invalid outputFormat", () => {
+    expect(() => ConfigSchema.parse({ geminiApiKey: "k", outputFormat: "bmp" })).toThrow();
+  });
+
+  it("rejects non-positive timeoutMs", () => {
+    expect(() => ConfigSchema.parse({ geminiApiKey: "k", timeoutMs: -1 })).toThrow();
+    expect(() => ConfigSchema.parse({ geminiApiKey: "k", timeoutMs: 0 })).toThrow();
+  });
+});
+
+// -------------------------------------------------------------------
+// CONSTANTS
+// -------------------------------------------------------------------
+
+describe("CONSTANTS", () => {
+  it("has expected key values", () => {
+    expect(CONSTANTS.OUTPUT_FORMAT).toBe("png");
+    expect(CONSTANTS.TIMEOUT_MS).toBe(120_000);
+    expect(CONSTANTS.RETRY_ATTEMPTS).toBe(3);
+    expect(CONSTANTS.RETRY_BASE_DELAY_MS).toBe(1_000);
+    expect(CONSTANTS.CONFIG_FILENAME).toBe(".nano-banana-config.json");
+    expect(CONSTANTS.SESSION_FILENAME).toBe(".nano-banana-session.json");
+    expect(CONSTANTS.PRICING_INPUT_PER_M).toBeGreaterThan(0);
+    expect(CONSTANTS.PRICING_OUTPUT_PER_M).toBeGreaterThan(0);
+  });
+});
+
+// -------------------------------------------------------------------
+// NanaBananaMCP — search
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP.handleSearch", () => {
+  let server: NanoBananaMCP;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+  });
+
+  it("returns all operations when no query provided", () => {
+    const result = callSearch(server);
+    const text = result.content[0].text as string;
+    expect(text).toContain("generate_image");
+    expect(text).toContain("edit_image");
+    expect(text).toContain("continue_editing");
+    expect(text).toContain("delete_image");
+    expect(text).toContain("enhance_prompt");
+    expect(text).toContain("configure_gemini_token");
+    expect(text).toContain("get_configuration_status");
+    expect(text).toContain("get_last_image_info");
+    expect(text).toContain("list_generated_images");
+  });
+
+  it("filters by operation name keyword", () => {
+    const result = callSearch(server, { query: "delete" });
+    const text = result.content[0].text as string;
+    expect(text).toContain("delete_image");
+    expect(text).not.toContain("generate_image");
+    expect(text).not.toContain("edit_image");
+  });
+
+  it("filters by description keyword", () => {
+    const result = callSearch(server, { query: "reference" });
+    const text = result.content[0].text as string;
+    expect(text).toContain("edit_image");
+  });
+
+  it("filters by tag keyword", () => {
+    const result = callSearch(server, { query: "config" });
+    const text = result.content[0].text as string;
+    expect(text).toContain("configure_gemini_token");
+    expect(text).toContain("get_configuration_status");
+  });
+
+  it("returns no-match message for unknown query", () => {
+    const result = callSearch(server, { query: "xyznonexistentabc" });
+    const text = result.content[0].text as string;
+    expect(text).toContain("No operations matched");
+    expect(text).toContain("xyznonexistentabc");
+  });
+
+  it("compact mode shows param name and type, not full description", () => {
+    const result = callSearch(server, { query: "generate_image", verbose: false });
+    const text = result.content[0].text as string;
+    expect(text).toContain("prompt (string)");
+    expect(text).not.toContain("Text prompt describing");
+  });
+
+  it("verbose mode includes full param descriptions", () => {
+    const result = callSearch(server, { query: "generate_image", verbose: true });
+    const text = result.content[0].text as string;
+    expect(text).toContain("Text prompt describing the image to create");
+  });
+
+  it("shows required and optional param labels correctly for edit_image", () => {
+    const result = callSearch(server, { query: "edit_image" });
+    const text = result.content[0].text as string;
+    expect(text).toContain("Required:");
+    expect(text).toContain("Optional:");
+  });
+
+  it("includes execute usage hint at the bottom", () => {
+    const result = callSearch(server);
+    const text = result.content[0].text as string;
+    expect(text).toContain("execute");
+  });
+});
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — execute dispatch
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP.handleExecute", () => {
+  let server: NanoBananaMCP;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+    stubFsDefaults();
+    vi.clearAllMocks();
+  });
+
+  it("throws InvalidParams for unknown operation", async () => {
+    await expect(callExecute(server, "nonexistent_op")).rejects.toMatchObject({
+      code: ErrorCode.InvalidParams,
     });
   });
 
-  describe('Image Generation', () => {
-    test('should format generation request correctly', () => {
-      const prompt = 'A cute nano-banana in a lab setting';
-      const expectedModel = 'gemini-2.5-flash-image-preview';
-      
-      expect(prompt).toContain('nano-banana');
-      expect(expectedModel).toBe('gemini-2.5-flash-image-preview');
-    });
-
-    test('should handle successful image generation', async () => {
-      const mockResponse = {
-        text: () => 'Image generated successfully with nano-banana technology',
-      };
-      
-      mockGenerateContent.mockResolvedValueOnce({
-        response: mockResponse,
-      });
-
-      const result = await mockGenerateContent('test prompt');
-      expect((result as any).response.text()).toContain('nano-banana');
-    });
-
-    test('should handle generation errors gracefully', async () => {
-      const error = new Error('API quota exceeded');
-      mockGenerateContent.mockRejectedValueOnce(error);
-
-      try {
-        await mockGenerateContent('test prompt');
-      } catch (e) {
-        expect((e as Error).message).toBe('API quota exceeded');
-      }
+  it("lists available operations in the error message", async () => {
+    await expect(callExecute(server, "bad_op")).rejects.toMatchObject({
+      message: expect.stringContaining("generate_image"),
     });
   });
 
-  describe('Image Editing', () => {
-    test('should handle MIME type detection', () => {
-      const getMimeType = (filePath: string): string => {
-        const ext = path.extname(filePath).toLowerCase();
-        switch (ext) {
-          case '.jpg':
-          case '.jpeg':
-            return 'image/jpeg';
-          case '.png':
-            return 'image/png';
-          case '.webp':
-            return 'image/webp';
-          default:
-            return 'image/jpeg';
-        }
-      };
-
-      expect(getMimeType('test.jpg')).toBe('image/jpeg');
-      expect(getMimeType('test.png')).toBe('image/png');
-      expect(getMimeType('test.webp')).toBe('image/webp');
-      expect(getMimeType('test.unknown')).toBe('image/jpeg');
+  it("throws InvalidParams when required params are missing", async () => {
+    configureServer(server);
+    await expect(callExecute(server, "generate_image", {})).rejects.toMatchObject({
+      code: ErrorCode.InvalidParams,
     });
+  });
 
-    test('should format image edit request with base64 data', () => {
-      const testImageData = Buffer.from('test image data');
-      const base64Data = testImageData.toString('base64');
-      
-      const imagePart = {
-        inlineData: {
-          data: base64Data,
-          mimeType: 'image/jpeg',
+  it("names the missing param in the error message", async () => {
+    configureServer(server);
+    await expect(callExecute(server, "generate_image", {})).rejects.toMatchObject({
+      message: expect.stringContaining("prompt"),
+    });
+  });
+
+  it("dispatches to the correct operation handler", async () => {
+    configureServer(server);
+    const spy = vi.spyOn(server as any, "opGetConfigurationStatus");
+    spy.mockResolvedValue({ content: [{ type: "text", text: "ok" }] });
+    const result = await callExecute(server, "get_configuration_status");
+    expect(spy).toHaveBeenCalledOnce();
+    expect(result.content[0].text).toBe("ok");
+  });
+});
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — configure_gemini_token
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP configure_gemini_token", () => {
+  let server: NanoBananaMCP;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+    stubFsDefaults();
+  });
+
+  it("sets config and genAI and returns success message", async () => {
+    const result = await callExecute(server, "configure_gemini_token", { apiKey: "test-key-123" });
+    expect(result.content[0].text).toContain("configured successfully");
+    expect((server as any).config).not.toBeNull();
+    expect((server as any).genAI).not.toBeNull();
+  });
+
+  it("saves config to file with restricted permissions", async () => {
+    await callExecute(server, "configure_gemini_token", { apiKey: "test-key-123" });
+    expect(fs.writeFile).toHaveBeenCalledWith(
+      expect.stringContaining(".nano-banana-config.json"),
+      expect.any(String),
+      expect.objectContaining({ mode: 0o600 })
+    );
+  });
+
+  it("throws InvalidParams when apiKey is missing", async () => {
+    await expect(callExecute(server, "configure_gemini_token", {})).rejects.toMatchObject({
+      code: ErrorCode.InvalidParams,
+    });
+  });
+});
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — generate_image
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP generate_image", () => {
+  let server: NanoBananaMCP;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+    configureServer(server);
+    stubFsDefaults();
+  });
+
+  it("throws InvalidRequest when not configured", async () => {
+    const unconfigured = new NanoBananaMCP();
+    await expect(callExecute(unconfigured, "generate_image", { prompt: "a cat" })).rejects.toMatchObject({
+      code: ErrorCode.InvalidRequest,
+    });
+  });
+
+  it("returns success with image content and saved file path", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{
+        content: {
+          parts: [
+            { text: "Here is your image." },
+            { inlineData: { data: "base64imagedata", mimeType: "image/png" } },
+          ],
         },
-      };
+      }],
+      usageMetadata: { totalTokenCount: 500, promptTokenCount: 400, candidatesTokenCount: 100 },
+    });
 
-      expect(imagePart.inlineData.data).toBe(base64Data);
-      expect(imagePart.inlineData.mimeType).toBe('image/jpeg');
+    const result = await callExecute(server, "generate_image", { prompt: "a cat" });
+    const texts = result.content.filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n");
+    expect(texts).toContain("Image generated with nano-banana");
+    expect(texts).toContain("a cat");
+    expect(texts).toContain("saved to");
+    expect(texts).toContain("Tokens used: 500");
+  });
+
+  it("writes the image file to disk", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ inlineData: { data: "abc123", mimeType: "image/png" } }] } }],
+      usageMetadata: { totalTokenCount: 100, promptTokenCount: 80, candidatesTokenCount: 20 },
+    });
+
+    await callExecute(server, "generate_image", { prompt: "a dog" });
+    expect(fs.writeFile).toHaveBeenCalledWith(
+      expect.stringContaining("generated-"),
+      expect.any(Buffer)
+    );
+  });
+
+  it("writes a sidecar JSON file alongside the image", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ inlineData: { data: "abc", mimeType: "image/png" } }] } }],
+      usageMetadata: { totalTokenCount: 100, promptTokenCount: 80, candidatesTokenCount: 20 },
+    });
+
+    await callExecute(server, "generate_image", { prompt: "sunset" });
+    const writeFileCalls = vi.mocked(fs.writeFile).mock.calls;
+    const jsonCall = writeFileCalls.find(([p]) => String(p).endsWith(".json") && !String(p).endsWith("session.json"));
+    expect(jsonCall).toBeDefined();
+    const sidecarContent = JSON.parse(String(jsonCall![1]));
+    expect(sidecarContent.operation).toBe("generate");
+    expect(sidecarContent.prompt).toBe("sunset");
+    expect(sidecarContent.model).toBe(CONSTANTS.MODEL);
+  });
+
+  it("saves session file after generating image", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ inlineData: { data: "abc", mimeType: "image/png" } }] } }],
+      usageMetadata: { totalTokenCount: 50, promptTokenCount: 40, candidatesTokenCount: 10 },
+    });
+
+    await callExecute(server, "generate_image", { prompt: "trees" });
+    const sessionCall = vi.mocked(fs.writeFile).mock.calls.find(([p]) =>
+      String(p).endsWith(".nano-banana-session.json")
+    );
+    expect(sessionCall).toBeDefined();
+  });
+
+  it("handles response with no image parts gracefully", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ text: "I cannot generate that." }] } }],
+      usageMetadata: { totalTokenCount: 10, promptTokenCount: 9, candidatesTokenCount: 1 },
+    });
+
+    const result = await callExecute(server, "generate_image", { prompt: "something" });
+    expect(result.content[0].text).toContain("No image was returned");
+  });
+
+  it("applies prompt prefix and suffix before calling the API", async () => {
+    configureServer(server, { promptPrefix: "HD, ", promptSuffix: ", cinematic" });
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [] } }],
+      usageMetadata: { totalTokenCount: 0, promptTokenCount: 0, candidatesTokenCount: 0 },
+    });
+
+    await callExecute(server, "generate_image", { prompt: "mountains" });
+    const calledWith = mockGenerateContent.mock.calls[0][0];
+    expect(calledWith.contents).toContain("HD, mountains, cinematic");
+  });
+
+  it("includes cost estimate in response for large token usage", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ inlineData: { data: "abc", mimeType: "image/png" } }] } }],
+      usageMetadata: { totalTokenCount: 1_000_000, promptTokenCount: 800_000, candidatesTokenCount: 200_000 },
+    });
+
+    const result = await callExecute(server, "generate_image", { prompt: "big prompt" });
+    const text = result.content[0].text as string;
+    expect(text).toContain("est. ~$");
+  });
+
+  it("throws classified error on API failure", async () => {
+    mockGenerateContent.mockRejectedValue(new Error("429 Too Many Requests"));
+    await expect(callExecute(server, "generate_image", { prompt: "a cat" })).rejects.toMatchObject({
+      code: ErrorCode.InternalError,
+    });
+  });
+});
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — edit_image
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP edit_image", () => {
+  let server: NanoBananaMCP;
+  const fakeImagePath = path.join(os.homedir(), "test-image.png");
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+    configureServer(server);
+    stubFsDefaults();
+    vi.mocked(fs.readFile).mockImplementation(async (p: any) => {
+      if (String(p).endsWith(".json")) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      return Buffer.from("fake image bytes");
     });
   });
 
-  describe('Tool Schema Validation', () => {
-    test('should have correct tool definitions', () => {
-      const expectedTools = [
-        'configure_gemini_token',
-        'generate_image', 
-        'edit_image',
-        'get_configuration_status',
-      ];
+  it("throws InvalidRequest when not configured", async () => {
+    const unconfigured = new NanoBananaMCP();
+    await expect(
+      callExecute(unconfigured, "edit_image", { imagePath: fakeImagePath, prompt: "edit" })
+    ).rejects.toMatchObject({ code: ErrorCode.InvalidRequest });
+  });
 
-      expectedTools.forEach(tool => {
-        expect(typeof tool).toBe('string');
-        expect(tool.length).toBeGreaterThan(0);
-      });
+  it("throws InvalidParams for paths outside allowed directories", async () => {
+    await expect(
+      callExecute(server, "edit_image", { imagePath: "/etc/passwd", prompt: "edit" })
+    ).rejects.toMatchObject({ code: ErrorCode.InvalidParams });
+  });
+
+  it("returns success with edited image content", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ inlineData: { data: "editeddata", mimeType: "image/png" } }] } }],
+      usageMetadata: { totalTokenCount: 300, promptTokenCount: 250, candidatesTokenCount: 50 },
     });
 
-    test('should validate required parameters', () => {
-      const configureSchema = {
-        apiKey: { required: true, type: 'string' },
-      };
+    const result = await callExecute(server, "edit_image", { imagePath: fakeImagePath, prompt: "add clouds" });
+    const text = result.content.find((c: any) => c.type === "text")?.text as string;
+    expect(text).toContain("Image edited with nano-banana");
+    expect(text).toContain("add clouds");
+  });
 
-      const generateSchema = {
-        prompt: { required: true, type: 'string' },
-      };
+  it("writes sidecar with sourceImage reference for edits", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ inlineData: { data: "editeddata", mimeType: "image/png" } }] } }],
+      usageMetadata: { totalTokenCount: 100, promptTokenCount: 80, candidatesTokenCount: 20 },
+    });
 
-      const editSchema = {
-        imagePath: { required: true, type: 'string' },
-        prompt: { required: true, type: 'string' },
-      };
+    await callExecute(server, "edit_image", { imagePath: fakeImagePath, prompt: "edit" });
 
-      expect(configureSchema.apiKey.required).toBe(true);
-      expect(generateSchema.prompt.required).toBe(true);
-      expect(editSchema.imagePath.required).toBe(true);
-      expect(editSchema.prompt.required).toBe(true);
+    const writeFileCalls = vi.mocked(fs.writeFile).mock.calls;
+    const jsonCall = writeFileCalls.find(([p]) => String(p).endsWith(".json") && !String(p).endsWith("session.json"));
+    const sidecar = JSON.parse(String(jsonCall![1]));
+    expect(sidecar.operation).toBe("edit");
+    expect(sidecar.sourceImage).toBe(fakeImagePath);
+  });
+
+  it("skips unreadable reference images without throwing", async () => {
+    vi.mocked(fs.readFile).mockImplementation(async (p: any) => {
+      if (String(p).includes("bad-ref")) throw new Error("ENOENT");
+      return Buffer.from("image bytes");
+    });
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ inlineData: { data: "d", mimeType: "image/png" } }] } }],
+      usageMetadata: { totalTokenCount: 50, promptTokenCount: 40, candidatesTokenCount: 10 },
+    });
+
+    const badRef = path.join(os.homedir(), "bad-ref.png");
+    await expect(
+      callExecute(server, "edit_image", {
+        imagePath: fakeImagePath,
+        prompt: "style it",
+        referenceImages: [badRef],
+      })
+    ).resolves.toBeDefined();
+  });
+
+  it("updates lastImagePath after successful edit", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ inlineData: { data: "d", mimeType: "image/png" } }] } }],
+      usageMetadata: { totalTokenCount: 50, promptTokenCount: 40, candidatesTokenCount: 10 },
+    });
+
+    await callExecute(server, "edit_image", { imagePath: fakeImagePath, prompt: "edit" });
+    expect((server as any).lastImagePath).toMatch(/edited-.*\.png$/);
+  });
+});
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — continue_editing
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP continue_editing", () => {
+  let server: NanoBananaMCP;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+    configureServer(server);
+    stubFsDefaults();
+  });
+
+  it("throws InvalidRequest when no previous image exists in session", async () => {
+    await expect(callExecute(server, "continue_editing", { prompt: "adjust" })).rejects.toMatchObject({
+      code: ErrorCode.InvalidRequest,
     });
   });
 
-  describe('Error Handling', () => {
-    test('should handle missing configuration', () => {
-      const isConfigured = (config: any, genAI: any): boolean => {
-        return config !== null && genAI !== null;
-      };
+  it("throws InvalidRequest when the last image file no longer exists", async () => {
+    (server as any).lastImagePath = path.join(os.homedir(), "missing.png");
+    vi.mocked(fs.access).mockRejectedValue(new Error("ENOENT"));
 
-      expect(isConfigured(null, null)).toBe(false);
-      expect(isConfigured({ apiKey: 'test' }, {})).toBe(true);
-    });
-
-    test('should validate input parameters', () => {
-      const validatePrompt = (prompt: string): boolean => {
-        return typeof prompt === 'string' && prompt.length > 0;
-      };
-
-      expect(validatePrompt('valid prompt')).toBe(true);
-      expect(validatePrompt('')).toBe(false);
-      expect(validatePrompt(undefined as any)).toBe(false);
+    await expect(callExecute(server, "continue_editing", { prompt: "adjust" })).rejects.toMatchObject({
+      code: ErrorCode.InvalidRequest,
     });
   });
 
-  describe('Integration Test Simulation', () => {
-    test('should simulate full workflow', async () => {
-      // 1. Configuration step
-      const apiKey = 'test-gemini-api-key';
-      expect(apiKey).toBeTruthy();
+  it("delegates to opEditImage when last image is accessible", async () => {
+    const imgPath = path.join(os.homedir(), "last.png");
+    (server as any).lastImagePath = imgPath;
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
 
-      // 2. Initialize Google AI client
-      const genAI = new MockGoogleGenerativeAI(apiKey);
-      expect(genAI).toBeDefined();
-
-      // 3. Generate image
-      mockGenerateContent.mockResolvedValueOnce({
-        response: { text: () => 'Generated nano-banana image successfully' },
-      });
-
-      const model = (genAI as any).getGenerativeModel({ model: 'gemini-2.5-flash-image-preview' });
-      const result = await model.generateContent('a nano-banana in space');
-      
-      expect((result as any).response.text()).toContain('nano-banana');
-
-      // 4. Verify model was called correctly
-      expect(mockGetGenerativeModel).toHaveBeenCalledWith({
-        model: 'gemini-2.5-flash-image-preview',
-      });
+    const editSpy = vi.spyOn(server as any, "opEditImage").mockResolvedValue({
+      content: [{ type: "text", text: "edited" }],
     });
 
-    test('should simulate error recovery', async () => {
-      // Simulate API error
-      mockGenerateContent.mockRejectedValueOnce(new Error('Rate limit exceeded'));
-
-      try {
-        const genAI = new MockGoogleGenerativeAI('test-key');
-        const model = (genAI as any).getGenerativeModel({ model: 'gemini-2.5-flash-image-preview' });
-        await model.generateContent('test prompt');
-      } catch (error) {
-        expect((error as Error).message).toBe('Rate limit exceeded');
-      }
-
-      // Simulate recovery
-      mockGenerateContent.mockResolvedValueOnce({
-        response: { text: () => 'Retry successful' },
-      });
-
-      const genAI = new MockGoogleGenerativeAI('test-key');
-      const model = (genAI as any).getGenerativeModel({ model: 'gemini-2.5-flash-image-preview' });
-      const result = await model.generateContent('test prompt');
-      
-      expect((result as any).response.text()).toBe('Retry successful');
+    await callExecute(server, "continue_editing", { prompt: "more contrast" });
+    expect(editSpy).toHaveBeenCalledWith({
+      imagePath: imgPath,
+      prompt: "more contrast",
+      referenceImages: undefined,
     });
+  });
+});
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — delete_image
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP delete_image", () => {
+  let server: NanoBananaMCP;
+  let imagesDir: string;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+    configureServer(server);
+    stubFsDefaults();
+    imagesDir = (server as any).getImagesDirectory();
+  });
+
+  it("throws InvalidParams when image path is outside the output directory", async () => {
+    await expect(
+      callExecute(server, "delete_image", { imagePath: "/etc/passwd" })
+    ).rejects.toMatchObject({ code: ErrorCode.InvalidParams });
+  });
+
+  it("throws InvalidParams when the file does not exist", async () => {
+    const imgPath = path.join(imagesDir, "missing.png");
+    vi.mocked(fs.access).mockRejectedValue(new Error("ENOENT"));
+
+    await expect(
+      callExecute(server, "delete_image", { imagePath: imgPath })
+    ).rejects.toMatchObject({ code: ErrorCode.InvalidParams });
+  });
+
+  it("deletes the image file", async () => {
+    const imgPath = path.join(imagesDir, "to-delete.png");
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+
+    await callExecute(server, "delete_image", { imagePath: imgPath });
+    expect(fs.unlink).toHaveBeenCalledWith(path.resolve(imgPath));
+  });
+
+  it("also deletes the sidecar JSON when it exists", async () => {
+    const imgPath = path.join(imagesDir, "to-delete.png");
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+
+    await callExecute(server, "delete_image", { imagePath: imgPath });
+    const deletedPaths = vi.mocked(fs.unlink).mock.calls.map(([p]) => String(p));
+    expect(deletedPaths.some(p => p.endsWith(".json"))).toBe(true);
+  });
+
+  it("clears lastImagePath and saves session when deleting the current last image", async () => {
+    const imgPath = path.join(imagesDir, "last.png");
+    (server as any).lastImagePath = path.resolve(imgPath);
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+
+    const result = await callExecute(server, "delete_image", { imagePath: imgPath });
+    expect((server as any).lastImagePath).toBeNull();
+    expect(result.content[0].text).toContain("session pointer has been cleared");
+    const sessionCall = vi.mocked(fs.writeFile).mock.calls.find(([p]) =>
+      String(p).endsWith(".nano-banana-session.json")
+    );
+    expect(sessionCall).toBeDefined();
+  });
+
+  it("returns success message with the deleted path", async () => {
+    const imgPath = path.join(imagesDir, "test.png");
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+
+    const result = await callExecute(server, "delete_image", { imagePath: imgPath });
+    expect(result.content[0].text).toContain("Deleted:");
+  });
+});
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — enhance_prompt
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP enhance_prompt", () => {
+  let server: NanoBananaMCP;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+    configureServer(server);
+    stubFsDefaults();
+  });
+
+  it("throws InvalidRequest when not configured", async () => {
+    const unconfigured = new NanoBananaMCP();
+    await expect(
+      callExecute(unconfigured, "enhance_prompt", { prompt: "a cat" })
+    ).rejects.toMatchObject({ code: ErrorCode.InvalidRequest });
+  });
+
+  it("returns the enhanced prompt text from Gemini", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{
+        content: { parts: [{ text: "A photorealistic close-up of a tabby cat with amber eyes, soft natural lighting, 8k." }] },
+      }],
+    });
+
+    const result = await callExecute(server, "enhance_prompt", { prompt: "a cat" });
+    expect(result.content[0].text).toContain("Enhanced prompt:");
+    expect(result.content[0].text).toContain("photorealistic");
+    expect(result.content[0].text).toContain("generate_image");
+  });
+
+  it("calls the TEXT_MODEL, not the image model", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ text: "Enhanced: detailed cat portrait" }] } }],
+    });
+
+    await callExecute(server, "enhance_prompt", { prompt: "a cat" });
+    expect(mockGenerateContent).toHaveBeenCalledWith(
+      expect.objectContaining({ model: CONSTANTS.TEXT_MODEL })
+    );
+  });
+
+  it("includes style hint in the instruction when provided", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ text: "An oil painting of..." }] } }],
+    });
+
+    await callExecute(server, "enhance_prompt", { prompt: "a landscape", style: "oil painting" });
+    const calledContents = mockGenerateContent.mock.calls[0][0].contents as string;
+    expect(calledContents).toContain("oil painting");
+  });
+
+  it("throws InternalError when Gemini returns no text", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [] } }],
+    });
+
+    await expect(
+      callExecute(server, "enhance_prompt", { prompt: "empty" })
+    ).rejects.toMatchObject({ code: ErrorCode.InternalError });
+  });
+
+  it("classifies API errors (e.g. auth failure)", async () => {
+    mockGenerateContent.mockRejectedValue(new Error("401 unauthenticated"));
+    await expect(
+      callExecute(server, "enhance_prompt", { prompt: "test" })
+    ).rejects.toMatchObject({ code: ErrorCode.InvalidRequest });
+  });
+});
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — get_configuration_status
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP get_configuration_status", () => {
+  let server: NanoBananaMCP;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+  });
+
+  it("returns not-configured message when no key set", async () => {
+    const result = await callExecute(server, "get_configuration_status", {});
+    expect(result.content[0].text).toContain("not configured");
+    expect(result.content[0].text).toContain("configure_gemini_token");
+  });
+
+  it("returns configured status with active settings when key is set", async () => {
+    configureServer(server);
+    const result = await callExecute(server, "get_configuration_status", {});
+    const text = result.content[0].text as string;
+    expect(text).toContain("configured and ready");
+    expect(text).toContain(CONSTANTS.MODEL);
+    expect(text).toContain("120s");
+  });
+
+  it("shows environment source when configured from env", async () => {
+    configureServer(server);
+    (server as any).configSource = "environment";
+    const result = await callExecute(server, "get_configuration_status", {});
+    expect(result.content[0].text).toContain("Environment variable");
+  });
+
+  it("shows file source when configured from config file", async () => {
+    configureServer(server);
+    (server as any).configSource = "config_file";
+    const result = await callExecute(server, "get_configuration_status", {});
+    expect(result.content[0].text).toContain("Local config file");
+  });
+
+  it("shows prompt prefix and suffix when configured", async () => {
+    configureServer(server, { promptPrefix: "HD, ", promptSuffix: ", masterpiece" });
+    const result = await callExecute(server, "get_configuration_status", {});
+    const text = result.content[0].text as string;
+    expect(text).toContain("HD, ");
+    expect(text).toContain(", masterpiece");
+  });
+});
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — get_last_image_info
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP get_last_image_info", () => {
+  let server: NanoBananaMCP;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+    configureServer(server);
+    stubFsDefaults();
+  });
+
+  it("returns a no-image message when session has no last image", async () => {
+    const result = await callExecute(server, "get_last_image_info", {});
+    expect(result.content[0].text).toContain("No image has been generated");
+  });
+
+  it("returns file path, size, and mtime when last image exists", async () => {
+    const imgPath = path.join(os.homedir(), "last.png");
+    (server as any).lastImagePath = imgPath;
+    vi.mocked(fs.stat).mockResolvedValue({ size: 204800, mtime: new Date("2025-06-01T10:00:00Z") } as any);
+    vi.mocked(fs.readFile).mockRejectedValue(new Error("no sidecar"));
+
+    const result = await callExecute(server, "get_last_image_info", {});
+    const text = result.content[0].text as string;
+    expect(text).toContain("200 KB");
+    expect(text).toContain(imgPath);
+  });
+
+  it("shows prompt from sidecar when sidecar is available", async () => {
+    const imgPath = path.join(os.homedir(), "last.png");
+    (server as any).lastImagePath = imgPath;
+    vi.mocked(fs.stat).mockResolvedValue({ size: 1024, mtime: new Date() } as any);
+    vi.mocked(fs.readFile).mockResolvedValue(
+      JSON.stringify({ operation: "generate", prompt: "a sunset", model: CONSTANTS.MODEL, timestamp: new Date().toISOString() })
+    );
+
+    const result = await callExecute(server, "get_last_image_info", {});
+    expect(result.content[0].text).toContain("a sunset");
+  });
+
+  it("returns a graceful message when the file has been deleted", async () => {
+    const imgPath = path.join(os.homedir(), "gone.png");
+    (server as any).lastImagePath = imgPath;
+    vi.mocked(fs.stat).mockRejectedValue(new Error("ENOENT"));
+
+    const result = await callExecute(server, "get_last_image_info", {});
+    expect(result.content[0].text).toContain("file not found");
+  });
+});
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — list_generated_images
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP list_generated_images", () => {
+  let server: NanoBananaMCP;
+  let imagesDir: string;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+    configureServer(server);
+    stubFsDefaults();
+    imagesDir = (server as any).getImagesDirectory();
+  });
+
+  it("returns no-directory message when output dir doesn't exist", async () => {
+    vi.mocked(fs.access).mockRejectedValue(new Error("ENOENT"));
+    const result = await callExecute(server, "list_generated_images", {});
+    expect(result.content[0].text).toContain("No output directory found");
+  });
+
+  it("returns no-images message when directory is empty", async () => {
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+    vi.mocked(fs.readdir).mockResolvedValue([] as any);
+
+    const result = await callExecute(server, "list_generated_images", {});
+    expect(result.content[0].text).toContain("No images found");
+  });
+
+  it("lists PNG/JPEG/WEBP images sorted newest first, excludes other files", async () => {
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+    vi.mocked(fs.readdir).mockResolvedValue([
+      { name: "generated-2025-01-01.png", isFile: () => true } as any,
+      { name: "generated-2025-06-01.png", isFile: () => true } as any,
+      { name: "README.txt", isFile: () => true } as any,
+    ]);
+    vi.mocked(fs.stat).mockResolvedValue({ size: 51200, mtime: new Date("2025-06-01") } as any);
+    vi.mocked(fs.readFile).mockRejectedValue(new Error("no sidecar"));
+
+    const result = await callExecute(server, "list_generated_images", {});
+    const text = result.content[0].text as string;
+    expect(text).toContain("generated-2025-06-01.png");
+    expect(text).not.toContain("README.txt");
+    const idx06 = text.indexOf("2025-06");
+    const idx01 = text.indexOf("2025-01");
+    expect(idx06).toBeLessThan(idx01);
+  });
+
+  it("respects the limit parameter", async () => {
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+    vi.mocked(fs.readdir).mockResolvedValue(
+      Array.from({ length: 10 }, (_, i) => ({
+        name: `generated-2025-0${String(i + 1).padStart(2, "0")}-01.png`,
+        isFile: () => true,
+      })) as any
+    );
+    vi.mocked(fs.stat).mockResolvedValue({ size: 1024, mtime: new Date() } as any);
+    vi.mocked(fs.readFile).mockRejectedValue(new Error("no sidecar"));
+
+    const result = await callExecute(server, "list_generated_images", { limit: 3 });
+    expect(result.content[0].text).toContain("Showing 3 of 10");
+  });
+
+  it("shows prompt snippet from sidecar when available", async () => {
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+    vi.mocked(fs.readdir).mockResolvedValue([
+      { name: "generated-img.png", isFile: () => true } as any,
+    ]);
+    vi.mocked(fs.stat).mockResolvedValue({ size: 1024, mtime: new Date() } as any);
+    vi.mocked(fs.readFile).mockResolvedValue(
+      JSON.stringify({ operation: "generate", prompt: "a sunset over mountains", model: CONSTANTS.MODEL, timestamp: new Date().toISOString() })
+    );
+
+    const result = await callExecute(server, "list_generated_images", {});
+    expect(result.content[0].text).toContain("a sunset over mountains");
+  });
+
+  it("marks the last session image with an indicator", async () => {
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+    vi.mocked(fs.readdir).mockResolvedValue([
+      { name: "last.png", isFile: () => true } as any,
+    ]);
+    vi.mocked(fs.stat).mockResolvedValue({ size: 1024, mtime: new Date() } as any);
+    vi.mocked(fs.readFile).mockRejectedValue(new Error("no sidecar"));
+    (server as any).lastImagePath = path.join(imagesDir, "last.png");
+
+    const result = await callExecute(server, "list_generated_images", {});
+    expect(result.content[0].text).toContain("← last");
+  });
+});
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — session persistence
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP session persistence", () => {
+  let server: NanoBananaMCP;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+    stubFsDefaults();
+  });
+
+  it("saveSession writes lastImagePath to the session file with restricted permissions", async () => {
+    (server as any).lastImagePath = "/home/user/image.png";
+    await (server as any).saveSession();
+    expect(fs.writeFile).toHaveBeenCalledWith(
+      expect.stringContaining(".nano-banana-session.json"),
+      expect.stringContaining("/home/user/image.png"),
+      expect.objectContaining({ mode: 0o600 })
+    );
+  });
+
+  it("loadSession restores lastImagePath when the session file and image both exist", async () => {
+    vi.mocked(fs.readFile).mockResolvedValueOnce(
+      JSON.stringify({ lastImagePath: "/home/user/image.png" })
+    );
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+
+    await (server as any).loadSession();
+    expect((server as any).lastImagePath).toBe("/home/user/image.png");
+  });
+
+  it("loadSession skips restore when the saved image path no longer exists on disk", async () => {
+    vi.mocked(fs.readFile).mockResolvedValueOnce(
+      JSON.stringify({ lastImagePath: "/home/user/gone.png" })
+    );
+    vi.mocked(fs.access).mockRejectedValue(new Error("ENOENT"));
+
+    await (server as any).loadSession();
+    expect((server as any).lastImagePath).toBeNull();
+  });
+
+  it("loadSession is a no-op when no session file exists", async () => {
+    vi.mocked(fs.readFile).mockRejectedValue(Object.assign(new Error("ENOENT"), { code: "ENOENT" }));
+    await expect((server as any).loadSession()).resolves.not.toThrow();
+    expect((server as any).lastImagePath).toBeNull();
+  });
+});
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — sidecar files
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP sidecar files", () => {
+  let server: NanoBananaMCP;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+    stubFsDefaults();
+  });
+
+  it("sidecarPath replaces image extension with .json", () => {
+    expect((server as any).sidecarPath("/images/generated-123.png")).toBe("/images/generated-123.json");
+    expect((server as any).sidecarPath("/images/edited-abc.jpg")).toBe("/images/edited-abc.json");
+  });
+
+  it("writeImageSidecar writes valid JSON with restricted permissions", async () => {
+    const sidecar = { operation: "generate" as const, prompt: "test", model: "m", timestamp: "t" };
+    await (server as any).writeImageSidecar("/images/img.png", sidecar);
+    expect(fs.writeFile).toHaveBeenCalledWith(
+      "/images/img.json",
+      expect.stringContaining('"prompt": "test"'),
+      expect.objectContaining({ mode: 0o600 })
+    );
+  });
+
+  it("writeImageSidecar does not throw when the write fails", async () => {
+    vi.mocked(fs.writeFile).mockRejectedValue(new Error("EPERM"));
+    await expect(
+      (server as any).writeImageSidecar("/images/img.png", {
+        operation: "generate", prompt: "p", model: "m", timestamp: ""
+      })
+    ).resolves.not.toThrow();
+  });
+
+  it("readImageSidecar returns parsed object when file exists", async () => {
+    const data = { operation: "generate", prompt: "sunset", model: "m", timestamp: "" };
+    vi.mocked(fs.readFile).mockResolvedValueOnce(JSON.stringify(data));
+    const result = await (server as any).readImageSidecar("/images/img.png");
+    expect(result).toEqual(data);
+  });
+
+  it("readImageSidecar returns null when file does not exist", async () => {
+    vi.mocked(fs.readFile).mockRejectedValue(new Error("ENOENT"));
+    const result = await (server as any).readImageSidecar("/images/img.png");
+    expect(result).toBeNull();
+  });
+});
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — applyPromptAffix
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP applyPromptAffix", () => {
+  let server: NanoBananaMCP;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+  });
+
+  it("returns original prompt unchanged when no prefix or suffix configured", () => {
+    configureServer(server, { promptPrefix: "", promptSuffix: "" });
+    expect((server as any).applyPromptAffix("mountains")).toBe("mountains");
+  });
+
+  it("prepends prefix to prompt", () => {
+    configureServer(server, { promptPrefix: "HD, ", promptSuffix: "" });
+    expect((server as any).applyPromptAffix("mountains")).toBe("HD, mountains");
+  });
+
+  it("appends suffix to prompt", () => {
+    configureServer(server, { promptPrefix: "", promptSuffix: ", cinematic" });
+    expect((server as any).applyPromptAffix("mountains")).toBe("mountains, cinematic");
+  });
+
+  it("applies both prefix and suffix", () => {
+    configureServer(server, { promptPrefix: "ultra HD, ", promptSuffix: ", 8k resolution" });
+    expect((server as any).applyPromptAffix("sunset")).toBe("ultra HD, sunset, 8k resolution");
+  });
+
+  it("handles null config safely by returning the original prompt", () => {
+    (server as any).config = null;
+    expect((server as any).applyPromptAffix("test")).toBe("test");
+  });
+});
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — buildSuccessResponse
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP buildSuccessResponse", () => {
+  let server: NanoBananaMCP;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+  });
+
+  it("formats a generate response with file path and continue-editing hint", () => {
+    const text = (server as any).buildSuccessResponse({
+      operation: "generated",
+      prompt: "a mountain",
+      savedFiles: ["/images/generated-123.png"],
+      textContent: "",
+    });
+    expect(text).toContain("Image generated with nano-banana");
+    expect(text).toContain("a mountain");
+    expect(text).toContain("/images/generated-123.png");
+    expect(text).toContain("continue_editing");
+  });
+
+  it("formats an edit response with original image path", () => {
+    const text = (server as any).buildSuccessResponse({
+      operation: "edited",
+      prompt: "add clouds",
+      savedFiles: ["/images/edited-456.png"],
+      textContent: "",
+      originalPath: "/images/original.png",
+    });
+    expect(text).toContain("Image edited with nano-banana");
+    expect(text).toContain("/images/original.png");
+    expect(text).toContain("add clouds");
+  });
+
+  it("includes token counts and cost estimate", () => {
+    const text = (server as any).buildSuccessResponse({
+      operation: "generated",
+      prompt: "test",
+      savedFiles: [],
+      textContent: "",
+      tokenUsage: { total: 1000, prompt: 800, response: 200 },
+    });
+    expect(text).toContain("Tokens used: 1,000");
+    expect(text).toContain("prompt: 800");
+    expect(text).toContain("response: 200");
+    expect(text).toContain("est.");
+  });
+
+  it("omits the token line entirely when no usage data is provided", () => {
+    const text = (server as any).buildSuccessResponse({
+      operation: "generated",
+      prompt: "test",
+      savedFiles: [],
+      textContent: "",
+    });
+    expect(text).not.toContain("Tokens used");
+  });
+
+  it("shows '<$0.001' for very small estimated costs", () => {
+    const text = (server as any).buildSuccessResponse({
+      operation: "generated",
+      prompt: "test",
+      savedFiles: [],
+      textContent: "",
+      tokenUsage: { total: 10, prompt: 9, response: 1 },
+    });
+    expect(text).toContain("<$0.001");
+  });
+
+  it("shows no-image note when savedFiles is empty", () => {
+    const text = (server as any).buildSuccessResponse({
+      operation: "generated",
+      prompt: "test",
+      savedFiles: [],
+      textContent: "",
+    });
+    expect(text).toContain("No image was returned");
+  });
+
+  it("includes the description text when provided", () => {
+    const text = (server as any).buildSuccessResponse({
+      operation: "generated",
+      prompt: "test",
+      savedFiles: ["/images/img.png"],
+      textContent: "This image shows a mountain.",
+    });
+    expect(text).toContain("This image shows a mountain.");
+  });
+
+  it("lists reference images when provided", () => {
+    const text = (server as any).buildSuccessResponse({
+      operation: "edited",
+      prompt: "style it",
+      savedFiles: ["/images/out.png"],
+      textContent: "",
+      referenceImages: ["/ref/style.jpg"],
+    });
+    expect(text).toContain("Reference images used");
+    expect(text).toContain("/ref/style.jpg");
   });
 });
