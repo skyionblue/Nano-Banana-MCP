@@ -1316,3 +1316,312 @@ describe("NanoBananaMCP buildSuccessResponse", () => {
     expect(text).toContain("/ref/style.jpg");
   });
 });
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — generateImageCore (internal)
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP generateImageCore", () => {
+  let server: NanoBananaMCP;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+    configureServer(server);
+    stubFsDefaults();
+  });
+
+  it("returns savedPaths and imageContent on success", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ inlineData: { data: "abc", mimeType: "image/png" } }] } }],
+      usageMetadata: { totalTokenCount: 100, promptTokenCount: 80, candidatesTokenCount: 20 },
+    });
+
+    const result = await (server as any).generateImageCore("a cat");
+    expect(result.savedPaths).toHaveLength(1);
+    expect(result.savedPaths[0]).toMatch(/generated-.*\.png$/);
+    expect(result.imageContent).toHaveLength(1);
+    expect(result.imageContent[0].type).toBe("image");
+    expect(result.tokenUsage?.total).toBe(100);
+  });
+
+  it("returns empty arrays when no image is returned", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ text: "I cannot generate that." }] } }],
+      usageMetadata: { totalTokenCount: 10, promptTokenCount: 9, candidatesTokenCount: 1 },
+    });
+
+    const result = await (server as any).generateImageCore("something");
+    expect(result.savedPaths).toHaveLength(0);
+    expect(result.imageContent).toHaveLength(0);
+    expect(result.textContent).toContain("cannot generate");
+  });
+
+  it("does NOT update lastImagePath (that is the caller's responsibility)", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ inlineData: { data: "abc", mimeType: "image/png" } }] } }],
+      usageMetadata: { totalTokenCount: 50, promptTokenCount: 40, candidatesTokenCount: 10 },
+    });
+
+    (server as any).lastImagePath = null;
+    await (server as any).generateImageCore("test");
+    expect((server as any).lastImagePath).toBeNull();
+  });
+
+  it("writes a sidecar for each saved image", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ inlineData: { data: "abc", mimeType: "image/png" } }] } }],
+      usageMetadata: { totalTokenCount: 50, promptTokenCount: 40, candidatesTokenCount: 10 },
+    });
+
+    await (server as any).generateImageCore("sunset");
+    const sidecarCall = vi.mocked(fs.writeFile).mock.calls.find(([p]) =>
+      String(p).endsWith(".json") && !String(p).endsWith("session.json")
+    );
+    expect(sidecarCall).toBeDefined();
+    const sidecar = JSON.parse(String(sidecarCall![1]));
+    expect(sidecar.operation).toBe("generate");
+    expect(sidecar.prompt).toBe("sunset");
+  });
+});
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — generate_image_batch
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP generate_image_batch", () => {
+  let server: NanoBananaMCP;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+    configureServer(server);
+    stubFsDefaults();
+  });
+
+  it("throws when not configured", async () => {
+    const unconfigured = new NanoBananaMCP();
+    await expect(
+      callExecute(unconfigured, "generate_image_batch", { prompt: "test" })
+    ).rejects.toMatchObject({ code: ErrorCode.InvalidRequest });
+  });
+
+  it("generates the requested number of images in parallel", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ inlineData: { data: "abc", mimeType: "image/png" } }] } }],
+      usageMetadata: { totalTokenCount: 100, promptTokenCount: 80, candidatesTokenCount: 20 },
+    });
+
+    const result = await callExecute(server, "generate_image_batch", { prompt: "sunset", count: 3 });
+    expect(mockGenerateContent).toHaveBeenCalledTimes(3);
+    expect(result.content[0].text).toContain("3/3");
+  });
+
+  it("defaults count to 2 when not specified", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ inlineData: { data: "abc", mimeType: "image/png" } }] } }],
+      usageMetadata: { totalTokenCount: 50, promptTokenCount: 40, candidatesTokenCount: 10 },
+    });
+
+    await callExecute(server, "generate_image_batch", { prompt: "test" });
+    expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+  });
+
+  it(`caps count at BATCH_MAX_COUNT (${CONSTANTS.BATCH_MAX_COUNT})`, async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ inlineData: { data: "abc", mimeType: "image/png" } }] } }],
+      usageMetadata: { totalTokenCount: 50, promptTokenCount: 40, candidatesTokenCount: 10 },
+    });
+
+    await callExecute(server, "generate_image_batch", { prompt: "test", count: 99 });
+    expect(mockGenerateContent).toHaveBeenCalledTimes(CONSTANTS.BATCH_MAX_COUNT);
+  });
+
+  it("sets lastImagePath to the first successful result", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ inlineData: { data: "abc", mimeType: "image/png" } }] } }],
+      usageMetadata: { totalTokenCount: 50, promptTokenCount: 40, candidatesTokenCount: 10 },
+    });
+
+    await callExecute(server, "generate_image_batch", { prompt: "test", count: 3 });
+    expect((server as any).lastImagePath).toMatch(/generated-.*\.png$/);
+  });
+
+  it("saves session after batch completes", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ inlineData: { data: "abc", mimeType: "image/png" } }] } }],
+      usageMetadata: { totalTokenCount: 50, promptTokenCount: 40, candidatesTokenCount: 10 },
+    });
+
+    await callExecute(server, "generate_image_batch", { prompt: "test", count: 2 });
+    const sessionCall = vi.mocked(fs.writeFile).mock.calls.find(([p]) =>
+      String(p).endsWith(".nano-banana-session.json")
+    );
+    expect(sessionCall).toBeDefined();
+  });
+
+  it("returns partial successes when some images fail", async () => {
+    // Spy on generateImageCore directly to avoid retry complexity
+    let callCount = 0;
+    vi.spyOn(server as any, "generateImageCore").mockImplementation(async () => {
+      callCount++;
+      if (callCount === 2) throw new Error("503 service unavailable");
+      return {
+        savedPaths: [path.join(os.homedir(), `img${callCount}.png`)],
+        imageContent: [],
+        textContent: "",
+        tokenUsage: { total: 50, prompt: 40, response: 10 },
+      };
+    });
+
+    const result = await callExecute(server, "generate_image_batch", { prompt: "test", count: 3 });
+    const text = result.content[0].text as string;
+    expect(text).toContain("2/3");
+    expect(text).toContain("failed");
+    expect(text).toContain("⚠️");
+  });
+
+  it("throws when ALL images fail", async () => {
+    mockGenerateContent.mockRejectedValue(new Error("401 unauthenticated"));
+    await expect(
+      callExecute(server, "generate_image_batch", { prompt: "test", count: 2 })
+    ).rejects.toMatchObject({ code: ErrorCode.InternalError });
+  });
+
+  it("includes aggregated token usage and cost in response", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ inlineData: { data: "abc", mimeType: "image/png" } }] } }],
+      usageMetadata: { totalTokenCount: 500_000, promptTokenCount: 400_000, candidatesTokenCount: 100_000 },
+    });
+
+    const result = await callExecute(server, "generate_image_batch", { prompt: "test", count: 2 });
+    const text = result.content[0].text as string;
+    expect(text).toContain("Total tokens:");
+    expect(text).toContain("est.");
+  });
+
+  it("includes all image content parts in the response", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ inlineData: { data: "abc", mimeType: "image/png" } }] } }],
+      usageMetadata: { totalTokenCount: 50, promptTokenCount: 40, candidatesTokenCount: 10 },
+    });
+
+    const result = await callExecute(server, "generate_image_batch", { prompt: "test", count: 3 });
+    const images = result.content.filter((c: any) => c.type === "image");
+    expect(images).toHaveLength(3);
+  });
+
+  it("lists all saved file paths in the response", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ inlineData: { data: "abc", mimeType: "image/png" } }] } }],
+      usageMetadata: { totalTokenCount: 50, promptTokenCount: 40, candidatesTokenCount: 10 },
+    });
+
+    const result = await callExecute(server, "generate_image_batch", { prompt: "waves", count: 2 });
+    const text = result.content[0].text as string;
+    const savedPaths = text.match(/- .*generated-.*\.png/g);
+    expect(savedPaths).toHaveLength(2);
+  });
+});
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — get_image_history
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP get_image_history", () => {
+  let server: NanoBananaMCP;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+    configureServer(server);
+    stubFsDefaults();
+  });
+
+  it("returns a no-sidecar message for an image with no metadata", async () => {
+    const imgPath = path.join(os.homedir(), "img.png");
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+    vi.mocked(fs.readFile).mockRejectedValue(new Error("ENOENT"));
+
+    const result = await callExecute(server, "get_image_history", { imagePath: imgPath });
+    expect(result.content[0].text).toContain("No history found");
+    expect(result.content[0].text).toContain("no metadata sidecar");
+  });
+
+  it("returns a single-entry chain for an original image with no sourceImage", async () => {
+    const imgPath = path.join(os.homedir(), "generated.png");
+    const sidecar = { operation: "generate", prompt: "a sunset", model: CONSTANTS.MODEL, timestamp: "2025-01-01T00:00:00.000Z" };
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+    vi.mocked(fs.readFile).mockResolvedValue(JSON.stringify(sidecar));
+
+    const result = await callExecute(server, "get_image_history", { imagePath: imgPath });
+    const text = result.content[0].text as string;
+    expect(text).toContain("1 image(s) in chain");
+    expect(text).toContain("[Original]");
+    expect(text).toContain("← current");
+    expect(text).toContain("a sunset");
+  });
+
+  it("walks a multi-step edit chain and shows oldest first", async () => {
+    const original = path.join(os.homedir(), "generated.png");
+    const edit1 = path.join(os.homedir(), "edited-1.png");
+    const edit2 = path.join(os.homedir(), "edited-2.png");
+
+    const sidecarFor = (p: string): object => {
+      if (p.endsWith("edited-2.json")) return { operation: "edit", prompt: "add clouds", model: CONSTANTS.MODEL, timestamp: "2025-01-03T00:00:00.000Z", sourceImage: edit1 };
+      if (p.endsWith("edited-1.json")) return { operation: "edit", prompt: "add birds", model: CONSTANTS.MODEL, timestamp: "2025-01-02T00:00:00.000Z", sourceImage: original };
+      if (p.endsWith("generated.json")) return { operation: "generate", prompt: "a sunset", model: CONSTANTS.MODEL, timestamp: "2025-01-01T00:00:00.000Z" };
+      throw new Error("ENOENT");
+    };
+
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+    vi.mocked(fs.readFile).mockImplementation(async (p: any) => JSON.stringify(sidecarFor(String(p))));
+
+    const result = await callExecute(server, "get_image_history", { imagePath: edit2 });
+    const text = result.content[0].text as string;
+    expect(text).toContain("3 image(s) in chain");
+    expect(text).toContain("[Original]");
+    expect(text).toContain("[Edit 1]");
+    expect(text).toContain("[Edit 2]");
+    expect(text).toContain("← current");
+    // Oldest first: original before edits
+    expect(text.indexOf("[Original]")).toBeLessThan(text.indexOf("[Edit 1]"));
+    expect(text.indexOf("[Edit 1]")).toBeLessThan(text.indexOf("[Edit 2]"));
+    expect(text).toContain("a sunset");
+    expect(text).toContain("add birds");
+    expect(text).toContain("add clouds");
+  });
+
+  it("marks missing ancestor files without throwing", async () => {
+    const original = path.join(os.homedir(), "generated.png");
+    const edit1 = path.join(os.homedir(), "edited-1.png");
+
+    vi.mocked(fs.access).mockImplementation(async (p: any) => {
+      if (String(p) === original) throw new Error("ENOENT");
+    });
+    vi.mocked(fs.readFile).mockImplementation(async (p: any) => {
+      if (String(p).endsWith("edited-1.json")) return JSON.stringify({ operation: "edit", prompt: "edit", model: CONSTANTS.MODEL, timestamp: "2025-01-02T00:00:00.000Z", sourceImage: original });
+      if (String(p).endsWith("generated.json")) return JSON.stringify({ operation: "generate", prompt: "original", model: CONSTANTS.MODEL, timestamp: "2025-01-01T00:00:00.000Z" });
+      throw new Error("ENOENT");
+    });
+
+    const result = await callExecute(server, "get_image_history", { imagePath: edit1 });
+    const text = result.content[0].text as string;
+    expect(text).toContain("(file missing)");
+    expect(text).toContain("[Original]");
+  });
+
+  it("handles circular sidecar references without looping forever", async () => {
+    const a = path.join(os.homedir(), "a.png");
+    const b = path.join(os.homedir(), "b.png");
+
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+    vi.mocked(fs.readFile).mockImplementation(async (p: any) => {
+      if (String(p).endsWith("a.json")) return JSON.stringify({ operation: "edit", prompt: "a", model: "m", timestamp: "t", sourceImage: b });
+      if (String(p).endsWith("b.json")) return JSON.stringify({ operation: "edit", prompt: "b", model: "m", timestamp: "t", sourceImage: a });
+      throw new Error("ENOENT");
+    });
+
+    // Should terminate without hanging
+    await expect(
+      callExecute(server, "get_image_history", { imagePath: a })
+    ).resolves.toBeDefined();
+  });
+});

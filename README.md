@@ -15,6 +15,8 @@ A Model Context Protocol (MCP) server that provides AI image generation and edit
 - 🔄 **Iterative Editing**: Continue editing across sessions — last image is persisted automatically
 - 🖼️ **Multiple Reference Images**: Use reference images for style transfer and content guidance
 - 🗑️ **Delete Images**: Remove generated images and their metadata cleanly
+- 🎞️ **Batch Generation**: Generate up to 5 variations of a prompt in parallel
+- 🔍 **Edit History**: Trace the full edit lineage of any image back to the original
 - ✨ **Enhance Prompts**: Use Gemini to expand rough prompts into detailed, high-quality prompts
 - 📋 **Image Listing**: Browse all generated images with the prompt that created each one
 - 📊 **Token & Cost Reporting**: See token counts and estimated cost in every response
@@ -245,6 +247,24 @@ List previously generated and edited images, sorted newest first. Shows the prom
 execute({
   "operation": "list_generated_images",
   "arguments": {"limit": 20}
+})
+```
+
+### `generate_image_batch`
+Generate multiple variations of the same prompt in parallel. Capped at 5 images per call. Returns partial successes if some fail, and sets the session target to the first successful result.
+```json
+execute({
+  "operation": "generate_image_batch",
+  "arguments": {"prompt": "a futuristic city", "count": 3}
+})
+```
+
+### `get_image_history`
+Trace the full edit lineage of any image back to its original generation. Walks the sidecar chain and displays each ancestor oldest-first.
+```json
+execute({
+  "operation": "get_image_history",
+  "arguments": {"imagePath": "/path/to/edited-image.png"}
 })
 ```
 
