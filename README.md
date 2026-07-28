@@ -15,10 +15,13 @@ A Model Context Protocol (MCP) server that provides AI image generation and edit
 - 🔄 **Iterative Editing**: Continue editing across sessions — last image is persisted automatically
 - 🖼️ **Multiple Reference Images**: Use reference images for style transfer and content guidance
 - 🗑️ **Delete Images**: Remove generated images and their metadata cleanly
-- 🎞️ **Batch Generation**: Generate up to 5 variations of a prompt in parallel
+- 🎞️ **Batch Generation**: Generate up to 5 variations of a prompt in parallel, with optional shared style references
 - 🔍 **Edit History**: Trace the full edit lineage of any image back to the original
+- ⏮️ **Revert to Original**: Jump straight back to the root of any edit chain in one call
+- 🔄 **Clear Session**: Reset the continue_editing target without deleting any files
+- 📤 **Export Images**: Copy a curated selection of results to any directory
 - ✨ **Enhance Prompts**: Use Gemini to expand rough prompts into detailed, high-quality prompts
-- 📋 **Image Listing**: Browse all generated images with the prompt that created each one
+- 📋 **Image Listing**: Browse all generated images with operation/date filtering and the prompt that created each one
 - 📊 **Token & Cost Reporting**: See token counts and estimated cost in every response
 - 📝 **Metadata Sidecars**: Each saved image gets a JSON companion with prompt, model, and token data
 - ⚙️ **Configurable**: Override model, output directory, format, timeout, and prompt style via env vars
@@ -267,6 +270,33 @@ Trace the full edit lineage of any image back to its original generation. Walks 
 execute({
   "operation": "get_image_history",
   "arguments": {"imagePath": "/path/to/edited-image.png"}
+})
+```
+
+### `clear_session`
+Reset the `continue_editing` target without deleting any files.
+```json
+execute({"operation": "clear_session", "arguments": {}})
+```
+
+### `revert_to_original`
+Walk the sidecar chain to find the root image and set it as the session target. Omit `imagePath` to use the current session target.
+```json
+execute({
+  "operation": "revert_to_original",
+  "arguments": {"imagePath": "/path/to/edited-image.png"}
+})
+```
+
+### `export_images`
+Copy a selection of generated images (and their sidecars) into a new directory. Omit `imagePaths` to export everything in the output directory.
+```json
+execute({
+  "operation": "export_images",
+  "arguments": {
+    "outputDir": "/Users/you/Desktop/best-results",
+    "imagePaths": ["/path/to/a.png", "/path/to/b.png"]
+  }
 })
 ```
 

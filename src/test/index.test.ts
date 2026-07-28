@@ -1713,3 +1713,354 @@ describe("NanoBananaMCP configure_gemini_token key format warnings", () => {
     expect(output).not.toContain("API key format warning");
   });
 });
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — clear_session
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP clear_session", () => {
+  let server: NanoBananaMCP;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+    configureServer(server);
+    stubFsDefaults();
+  });
+
+  it("clears lastImagePath and saves session", async () => {
+    (server as any).lastImagePath = path.join(os.homedir(), "img.png");
+    const result = await callExecute(server, "clear_session", {});
+    expect((server as any).lastImagePath).toBeNull();
+    const sessionCall = vi.mocked(fs.writeFile).mock.calls.find(([p]) =>
+      String(p).endsWith(".nano-banana-session.json")
+    );
+    expect(sessionCall).toBeDefined();
+    expect(result.content[0].text).toContain("cleared");
+  });
+
+  it("returns an 'already empty' message when no session target was set", async () => {
+    const result = await callExecute(server, "clear_session", {});
+    expect(result.content[0].text).toContain("already empty");
+  });
+
+  it("does not delete any image files", async () => {
+    (server as any).lastImagePath = path.join(os.homedir(), "img.png");
+    await callExecute(server, "clear_session", {});
+    expect(fs.unlink).not.toHaveBeenCalled();
+  });
+});
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — revert_to_original
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP revert_to_original", () => {
+  let server: NanoBananaMCP;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+    configureServer(server);
+    stubFsDefaults();
+  });
+
+  it("throws when no imagePath and no session target", async () => {
+    await expect(callExecute(server, "revert_to_original", {})).rejects.toMatchObject({
+      code: ErrorCode.InvalidRequest,
+    });
+  });
+
+  it("returns 'already original' when image has no sourceImage sidecar", async () => {
+    const imgPath = path.join(os.homedir(), "generated.png");
+    vi.mocked(fs.readFile).mockResolvedValue(
+      JSON.stringify({ operation: "generate", prompt: "p", model: "m", timestamp: "t" })
+    );
+    const result = await callExecute(server, "revert_to_original", { imagePath: imgPath });
+    expect(result.content[0].text).toContain("already the original");
+  });
+
+  it("walks the chain and sets lastImagePath to the root image", async () => {
+    const original = path.join(os.homedir(), "generated.png");
+    const edit1 = path.join(os.homedir(), "edited-1.png");
+    const edit2 = path.join(os.homedir(), "edited-2.png");
+
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+    vi.mocked(fs.readFile).mockImplementation(async (p: any) => {
+      if (String(p).endsWith("edited-2.json")) return JSON.stringify({ operation: "edit", prompt: "e2", model: "m", timestamp: "t", sourceImage: edit1 });
+      if (String(p).endsWith("edited-1.json")) return JSON.stringify({ operation: "edit", prompt: "e1", model: "m", timestamp: "t", sourceImage: original });
+      if (String(p).endsWith("generated.json")) return JSON.stringify({ operation: "generate", prompt: "orig", model: "m", timestamp: "t" });
+      throw new Error("ENOENT");
+    });
+
+    const result = await callExecute(server, "revert_to_original", { imagePath: edit2 });
+    expect((server as any).lastImagePath).toBe(path.resolve(original));
+    expect(result.content[0].text).toContain("reverted to original");
+    expect(result.content[0].text).toContain(path.resolve(original));
+  });
+
+  it("uses session lastImagePath when no imagePath argument given", async () => {
+    const original = path.join(os.homedir(), "generated.png");
+    const edit1 = path.join(os.homedir(), "edited-1.png");
+    (server as any).lastImagePath = edit1;
+
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+    vi.mocked(fs.readFile).mockImplementation(async (p: any) => {
+      if (String(p).endsWith("edited-1.json")) return JSON.stringify({ operation: "edit", prompt: "e1", model: "m", timestamp: "t", sourceImage: original });
+      if (String(p).endsWith("generated.json")) return JSON.stringify({ operation: "generate", prompt: "orig", model: "m", timestamp: "t" });
+      throw new Error("ENOENT");
+    });
+
+    await callExecute(server, "revert_to_original", {});
+    expect((server as any).lastImagePath).toBe(path.resolve(original));
+  });
+
+  it("throws when the original file no longer exists on disk", async () => {
+    const original = path.join(os.homedir(), "generated.png");
+    const edit1 = path.join(os.homedir(), "edited-1.png");
+
+    vi.mocked(fs.access).mockRejectedValue(new Error("ENOENT"));
+    vi.mocked(fs.readFile).mockImplementation(async (p: any) => {
+      if (String(p).endsWith("edited-1.json")) return JSON.stringify({ operation: "edit", prompt: "e", model: "m", timestamp: "t", sourceImage: original });
+      if (String(p).endsWith("generated.json")) return JSON.stringify({ operation: "generate", prompt: "p", model: "m", timestamp: "t" });
+      throw new Error("ENOENT");
+    });
+
+    await expect(callExecute(server, "revert_to_original", { imagePath: edit1 })).rejects.toMatchObject({
+      code: ErrorCode.InvalidRequest,
+    });
+  });
+
+  it("saves session after reverting", async () => {
+    const original = path.join(os.homedir(), "generated.png");
+    const edit1 = path.join(os.homedir(), "edited-1.png");
+
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+    vi.mocked(fs.readFile).mockImplementation(async (p: any) => {
+      if (String(p).endsWith("edited-1.json")) return JSON.stringify({ operation: "edit", prompt: "e", model: "m", timestamp: "t", sourceImage: original });
+      if (String(p).endsWith("generated.json")) return JSON.stringify({ operation: "generate", prompt: "p", model: "m", timestamp: "t" });
+      throw new Error("ENOENT");
+    });
+
+    await callExecute(server, "revert_to_original", { imagePath: edit1 });
+    const sessionCall = vi.mocked(fs.writeFile).mock.calls.find(([p]) =>
+      String(p).endsWith(".nano-banana-session.json")
+    );
+    expect(sessionCall).toBeDefined();
+  });
+});
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — export_images
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP export_images", () => {
+  let server: NanoBananaMCP;
+  let imagesDir: string;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+    configureServer(server);
+    stubFsDefaults();
+    imagesDir = (server as any).getImagesDirectory();
+  });
+
+  it("throws when no images directory exists and no specific paths given", async () => {
+    vi.mocked(fs.readdir).mockRejectedValue(new Error("ENOENT"));
+    await expect(
+      callExecute(server, "export_images", { outputDir: "/tmp/export" })
+    ).rejects.toMatchObject({ code: ErrorCode.InvalidRequest });
+  });
+
+  it("returns 'no images' when directory is empty", async () => {
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+    vi.mocked(fs.readdir).mockResolvedValue([] as any);
+    const result = await callExecute(server, "export_images", { outputDir: "/tmp/export" });
+    expect(result.content[0].text).toContain("No images to export");
+  });
+
+  it("copies all images from the output directory to the export dir", async () => {
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+    vi.mocked(fs.readdir).mockResolvedValue([
+      { name: "generated-a.png", isFile: () => true } as any,
+      { name: "edited-b.png", isFile: () => true } as any,
+    ]);
+    vi.mocked(fs.copyFile).mockResolvedValue(undefined as any);
+
+    const result = await callExecute(server, "export_images", { outputDir: "/tmp/export" });
+    expect(fs.copyFile).toHaveBeenCalledTimes(4); // 2 images + 2 sidecar attempts
+    expect(result.content[0].text).toContain("Exported 2 image(s)");
+    expect(result.content[0].text).toContain("/tmp/export");
+  });
+
+  it("exports only the specified imagePaths when provided", async () => {
+    vi.mocked(fs.copyFile).mockResolvedValue(undefined as any);
+    const imgA = path.join(imagesDir, "a.png");
+    const imgB = path.join(imagesDir, "b.png");
+
+    const result = await callExecute(server, "export_images", {
+      outputDir: "/tmp/export",
+      imagePaths: [imgA, imgB],
+    });
+    expect(result.content[0].text).toContain("Exported 2 image(s)");
+  });
+
+  it("creates the output directory if it does not exist", async () => {
+    vi.mocked(fs.readdir).mockResolvedValue([
+      { name: "img.png", isFile: () => true } as any,
+    ]);
+    vi.mocked(fs.copyFile).mockResolvedValue(undefined as any);
+
+    await callExecute(server, "export_images", { outputDir: "/tmp/new-dir/export" });
+    expect(fs.mkdir).toHaveBeenCalledWith(
+      path.resolve("/tmp/new-dir/export"),
+      expect.objectContaining({ recursive: true })
+    );
+  });
+
+  it("reports skipped images when copyFile fails", async () => {
+    vi.mocked(fs.readdir).mockResolvedValue([
+      { name: "a.png", isFile: () => true } as any,
+      { name: "b.png", isFile: () => true } as any,
+    ]);
+    vi.mocked(fs.copyFile).mockImplementation(async (src: any) => {
+      if (String(src).endsWith("b.png")) throw new Error("EACCES");
+    });
+
+    const result = await callExecute(server, "export_images", { outputDir: "/tmp/export" });
+    expect(result.content[0].text).toContain("Exported 1 image(s)");
+    expect(result.content[0].text).toContain("⚠️");
+    expect(result.content[0].text).toContain("b.png");
+  });
+});
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — list_generated_images filtering
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP list_generated_images filtering", () => {
+  let server: NanoBananaMCP;
+  let imagesDir: string;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+    configureServer(server);
+    stubFsDefaults();
+    imagesDir = (server as any).getImagesDirectory();
+
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+    vi.mocked(fs.readdir).mockResolvedValue([
+      { name: "generated-a.png", isFile: () => true } as any,
+      { name: "edited-b.png", isFile: () => true } as any,
+    ]);
+    vi.mocked(fs.stat).mockResolvedValue({ size: 1024, mtime: new Date("2025-06-01T00:00:00Z") } as any);
+  });
+
+  it("filters to only 'generate' operations", async () => {
+    vi.mocked(fs.readFile).mockImplementation(async (p: any) => {
+      if (String(p).endsWith("generated-a.json")) return JSON.stringify({ operation: "generate", prompt: "gen", model: "m", timestamp: "2025-06-01T00:00:00Z" });
+      if (String(p).endsWith("edited-b.json")) return JSON.stringify({ operation: "edit", prompt: "edit", model: "m", timestamp: "2025-06-01T00:00:00Z" });
+      throw new Error("ENOENT");
+    });
+
+    const result = await callExecute(server, "list_generated_images", { operation: "generate" });
+    const text = result.content[0].text as string;
+    expect(text).toContain("generated-a.png");
+    expect(text).not.toContain("edited-b.png");
+  });
+
+  it("filters to only 'edit' operations", async () => {
+    vi.mocked(fs.readFile).mockImplementation(async (p: any) => {
+      if (String(p).endsWith("generated-a.json")) return JSON.stringify({ operation: "generate", prompt: "gen", model: "m", timestamp: "2025-06-01T00:00:00Z" });
+      if (String(p).endsWith("edited-b.json")) return JSON.stringify({ operation: "edit", prompt: "edit", model: "m", timestamp: "2025-06-01T00:00:00Z" });
+      throw new Error("ENOENT");
+    });
+
+    const result = await callExecute(server, "list_generated_images", { operation: "edit" });
+    const text = result.content[0].text as string;
+    expect(text).toContain("edited-b.png");
+    expect(text).not.toContain("generated-a.png");
+  });
+
+  it("filters by 'since' date using sidecar timestamp", async () => {
+    vi.mocked(fs.readFile).mockImplementation(async (p: any) => {
+      if (String(p).endsWith("generated-a.json")) return JSON.stringify({ operation: "generate", prompt: "new", model: "m", timestamp: "2025-07-01T00:00:00Z" });
+      if (String(p).endsWith("edited-b.json")) return JSON.stringify({ operation: "edit", prompt: "old", model: "m", timestamp: "2025-01-01T00:00:00Z" });
+      throw new Error("ENOENT");
+    });
+
+    const result = await callExecute(server, "list_generated_images", { since: "2025-06-01" });
+    const text = result.content[0].text as string;
+    expect(text).toContain("generated-a.png");
+    expect(text).not.toContain("edited-b.png");
+  });
+
+  it("returns no-match message when filters exclude everything", async () => {
+    vi.mocked(fs.readFile).mockResolvedValue(
+      JSON.stringify({ operation: "generate", prompt: "p", model: "m", timestamp: "2025-01-01T00:00:00Z" })
+    );
+
+    const result = await callExecute(server, "list_generated_images", {
+      operation: "edit",
+      since: "2026-01-01",
+    });
+    expect(result.content[0].text).toContain("No images found");
+    expect(result.content[0].text).toContain("operation=");
+  });
+
+  it("shows operation tag in each result row", async () => {
+    vi.mocked(fs.readFile).mockResolvedValue(
+      JSON.stringify({ operation: "generate", prompt: "p", model: "m", timestamp: "2025-01-01T00:00:00Z" })
+    );
+
+    const result = await callExecute(server, "list_generated_images", {});
+    expect(result.content[0].text).toContain("[generate]");
+  });
+});
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — generate_image_batch with referenceImages
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP generate_image_batch with referenceImages", () => {
+  let server: NanoBananaMCP;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+    configureServer(server);
+    stubFsDefaults();
+    vi.mocked(fs.readFile).mockImplementation(async (p: any) => {
+      if (String(p).endsWith(".json")) throw new Error("ENOENT");
+      return Buffer.from("fake ref image bytes");
+    });
+  });
+
+  it("passes reference images to each generateImageCore call", async () => {
+    const coreSpy = vi.spyOn(server as any, "generateImageCore").mockResolvedValue({
+      savedPaths: [path.join(os.homedir(), "img.png")],
+      imageContent: [],
+      textContent: "",
+      tokenUsage: { total: 50, prompt: 40, response: 10 },
+    });
+
+    const refPath = path.join(os.homedir(), "style.png");
+    await callExecute(server, "generate_image_batch", {
+      prompt: "a city",
+      count: 2,
+      referenceImages: [refPath],
+    });
+
+    expect(coreSpy).toHaveBeenCalledTimes(2);
+    expect(coreSpy).toHaveBeenCalledWith("a city", [refPath]);
+  });
+
+  it("works without referenceImages (passes undefined)", async () => {
+    const coreSpy = vi.spyOn(server as any, "generateImageCore").mockResolvedValue({
+      savedPaths: [path.join(os.homedir(), "img.png")],
+      imageContent: [],
+      textContent: "",
+      tokenUsage: { total: 50, prompt: 40, response: 10 },
+    });
+
+    await callExecute(server, "generate_image_batch", { prompt: "a cat", count: 1 });
+    expect(coreSpy).toHaveBeenCalledWith("a cat", undefined);
+  });
+});
