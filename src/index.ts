@@ -27,6 +27,7 @@ export const CONSTANTS = {
   // Gemini 2.5 Flash approximate pricing — USD per million tokens
   PRICING_INPUT_PER_M: 0.075,
   PRICING_OUTPUT_PER_M: 0.30,
+  BATCH_MAX_COUNT: 5,
 } as const;
 
 // --- Logger ---
@@ -170,7 +171,7 @@ export class NanoBananaMCP {
 
   constructor() {
     this.server = new Server(
-      { name: "nano-banana-mcp", version: "1.2.0" },
+      { name: "nano-banana-mcp", version: "1.3.0" },
       { capabilities: { tools: {} } }
     );
 
@@ -246,6 +247,23 @@ export class NanoBananaMCP {
           limit: { type: "number", description: "Maximum number of images to return (default: 20)", required: false },
         },
         handler: (args) => this.opListGeneratedImages(args as { limit?: number }),
+      },
+      generate_image_batch: {
+        description: `Generate multiple variations of the same prompt in parallel and save all of them. Capped at ${CONSTANTS.BATCH_MAX_COUNT} images per call to avoid runaway costs. Sets the session's last image to the first successful result.`,
+        tags: ["generate", "batch", "multiple", "variations", "parallel"],
+        params: {
+          prompt: { type: "string", description: "Text prompt describing the images to create", required: true },
+          count: { type: "number", description: `Number of images to generate (default: 2, max: ${CONSTANTS.BATCH_MAX_COUNT})`, required: false },
+        },
+        handler: (args) => this.opGenerateImageBatch(args as { prompt: string; count?: number }),
+      },
+      get_image_history: {
+        description: "Show the full edit lineage of an image by walking its sidecar chain. Returns each ancestor in order from the original generation through every edit that produced the current file.",
+        tags: ["history", "chain", "edit", "lineage", "sidecar", "trace"],
+        params: {
+          imagePath: { type: "string", description: "Full file path to the image whose history you want to trace", required: true },
+        },
+        handler: (args) => this.opGetImageHistory(args as { imagePath: string }),
       },
     };
 
@@ -675,73 +693,161 @@ export class NanoBananaMCP {
     }
   }
 
+  // Core image generation — saves file + sidecar, returns paths and image content.
+  // Does NOT update lastImagePath or save session (callers do that).
+  private async generateImageCore(originalPrompt: string): Promise<{
+    savedPaths: string[];
+    imageContent: McpImageContent[];
+    textContent: string;
+    tokenUsage?: { total: number; prompt: number; response: number };
+  }> {
+    const prompt = this.applyPromptAffix(originalPrompt);
+    const response = await this.withRetry(
+      () => this.withTimeout(
+        this.genAI!.models.generateContent({ model: this.config!.model, contents: prompt }),
+        this.config!.timeoutMs,
+        "generate_image"
+      ),
+      "generate_image"
+    );
+
+    const savedPaths: string[] = [];
+    const imageContent: McpImageContent[] = [];
+    let textContent = "";
+
+    const imagesDir = this.getImagesDirectory();
+    await fs.mkdir(imagesDir, { recursive: true, mode: 0o755 });
+
+    const usageMetadata = response.usageMetadata;
+    const tokenUsage = usageMetadata
+      ? { total: usageMetadata.totalTokenCount ?? 0, prompt: usageMetadata.promptTokenCount ?? 0, response: usageMetadata.candidatesTokenCount ?? 0 }
+      : undefined;
+
+    for (const part of response.candidates?.[0]?.content?.parts ?? []) {
+      if (part.text) textContent += part.text;
+      if (part.inlineData?.data) {
+        const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+        const randomId = Math.random().toString(36).substring(2, 8);
+        const ext = this.config!.outputFormat === "jpeg" ? "jpg" : this.config!.outputFormat;
+        const filePath = path.join(imagesDir, `generated-${timestamp}-${randomId}.${ext}`);
+
+        const imageBytes = Buffer.from(part.inlineData.data, "base64");
+        await fs.writeFile(filePath, imageBytes);
+        savedPaths.push(filePath);
+        log.info("Image saved", { path: filePath, sizeKb: Math.round(imageBytes.length / 1024) });
+
+        await this.writeImageSidecar(filePath, {
+          operation: "generate",
+          prompt: originalPrompt,
+          model: this.config!.model,
+          timestamp: new Date().toISOString(),
+          tokenUsage,
+        });
+
+        imageContent.push({ type: "image", data: part.inlineData.data, mimeType: part.inlineData.mimeType || "image/png" });
+      }
+    }
+
+    if (tokenUsage) log.debug("generate_image: token usage", tokenUsage);
+    return { savedPaths, imageContent, textContent, tokenUsage };
+  }
+
   private async opGenerateImage(args: { prompt: string }): Promise<CallToolResult> {
     this.ensureConfigured();
-    const prompt = this.applyPromptAffix(args.prompt);
     log.debug("generate_image: calling Gemini API", { model: this.config!.model, timeoutMs: this.config!.timeoutMs });
 
     try {
-      const response = await this.withRetry(
-        () => this.withTimeout(
-          this.genAI!.models.generateContent({ model: this.config!.model, contents: prompt }),
-          this.config!.timeoutMs,
-          "generate_image"
-        ),
-        "generate_image"
-      );
+      const { savedPaths, imageContent, textContent, tokenUsage } = await this.generateImageCore(args.prompt);
 
-      const content: McpContent[] = [];
-      const savedFiles: string[] = [];
-      let textContent = "";
-
-      const imagesDir = this.getImagesDirectory();
-      log.debug("generate_image: output directory", { imagesDir });
-      await fs.mkdir(imagesDir, { recursive: true, mode: 0o755 });
-
-      const usageMetadata = response.usageMetadata;
-      const tokenUsage = usageMetadata
-        ? { total: usageMetadata.totalTokenCount ?? 0, prompt: usageMetadata.promptTokenCount ?? 0, response: usageMetadata.candidatesTokenCount ?? 0 }
-        : undefined;
-
-      for (const part of response.candidates?.[0]?.content?.parts ?? []) {
-        if (part.text) {
-          log.debug("generate_image: received text part");
-          textContent += part.text;
-        }
-
-        if (part.inlineData?.data) {
-          const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-          const randomId = Math.random().toString(36).substring(2, 8);
-          const ext = this.config!.outputFormat === "jpeg" ? "jpg" : this.config!.outputFormat;
-          const filePath = path.join(imagesDir, `generated-${timestamp}-${randomId}.${ext}`);
-
-          const imageBytes = Buffer.from(part.inlineData.data, "base64");
-          await fs.writeFile(filePath, imageBytes);
-          savedFiles.push(filePath);
-          this.lastImagePath = filePath;
-          log.info("Image saved", { path: filePath, sizeKb: Math.round(imageBytes.length / 1024) });
-
-          await this.writeImageSidecar(filePath, {
-            operation: "generate",
-            prompt: args.prompt,
-            model: this.config!.model,
-            timestamp: new Date().toISOString(),
-            tokenUsage,
-          });
-
-          content.push({ type: "image", data: part.inlineData.data, mimeType: part.inlineData.mimeType || "image/png" });
-        }
+      if (savedPaths.length > 0) {
+        this.lastImagePath = savedPaths[savedPaths.length - 1];
+        await this.saveSession();
       }
 
-      if (tokenUsage) log.debug("generate_image: token usage", tokenUsage);
-      if (savedFiles.length > 0) await this.saveSession();
-
-      content.unshift({ type: "text", text: this.buildSuccessResponse({ operation: "generated", prompt: args.prompt, savedFiles, textContent, tokenUsage }) });
+      const content: McpContent[] = [
+        { type: "text", text: this.buildSuccessResponse({ operation: "generated", prompt: args.prompt, savedFiles: savedPaths, textContent, tokenUsage }) },
+        ...imageContent,
+      ];
       return { content };
     } catch (error) {
       log.error("generate_image failed", { error: error instanceof Error ? error.message : String(error) });
       throw classifyApiError(error, "generate_image");
     }
+  }
+
+  private async opGenerateImageBatch(args: { prompt: string; count?: number }): Promise<CallToolResult> {
+    this.ensureConfigured();
+
+    const count = Math.min(Math.max(args.count ?? 2, 1), CONSTANTS.BATCH_MAX_COUNT);
+    log.info("generate_image_batch starting", { count, model: this.config!.model });
+
+    const results = await Promise.allSettled(
+      Array.from({ length: count }, () => this.generateImageCore(args.prompt))
+    );
+
+    type CoreResult = { savedPaths: string[]; imageContent: McpImageContent[]; textContent: string; tokenUsage?: { total: number; prompt: number; response: number } };
+    const successes: CoreResult[] = [];
+    const failureMessages: string[] = [];
+
+    for (const result of results) {
+      if (result.status === "fulfilled") {
+        successes.push(result.value);
+      } else {
+        const err = classifyApiError(result.reason, "generate_image_batch");
+        failureMessages.push(err.message);
+        log.warn("Batch item failed", { error: result.reason instanceof Error ? result.reason.message : String(result.reason) });
+      }
+    }
+
+    if (successes.length === 0) {
+      throw new McpError(ErrorCode.InternalError,
+        `All ${count} batch generations failed. First error: ${failureMessages[0]}`);
+    }
+
+    // Set lastImagePath to the first successful image
+    const firstSavedPath = successes.find(s => s.savedPaths.length > 0)?.savedPaths[0] ?? null;
+    if (firstSavedPath) {
+      this.lastImagePath = firstSavedPath;
+      await this.saveSession();
+    }
+
+    const allSavedPaths = successes.flatMap(s => s.savedPaths);
+    const totalTokens = successes.reduce((sum, s) => sum + (s.tokenUsage?.total ?? 0), 0);
+    const promptTokens = successes.reduce((sum, s) => sum + (s.tokenUsage?.prompt ?? 0), 0);
+    const responseTokens = successes.reduce((sum, s) => sum + (s.tokenUsage?.response ?? 0), 0);
+    const tokenUsage = totalTokens > 0 ? { total: totalTokens, prompt: promptTokens, response: responseTokens } : undefined;
+
+    const lines: string[] = [];
+    if (successes.length === count) {
+      lines.push(`Generated ${count}/${count} images successfully.\n`);
+    } else {
+      lines.push(`Generated ${successes.length}/${count} images (${failureMessages.length} failed).\n`);
+    }
+
+    lines.push(`Prompt: "${args.prompt}"`);
+
+    if (allSavedPaths.length > 0) {
+      lines.push(`\n📁 Images saved to:\n${allSavedPaths.map(p => `- ${p}`).join("\n")}`);
+      lines.push(`\n💡 First image set as session target — use continue_editing to iterate on it.`);
+    }
+
+    if (failureMessages.length > 0) {
+      lines.push(`\n⚠️  Failed generations:\n${failureMessages.map(m => `- ${m}`).join("\n")}`);
+    }
+
+    if (tokenUsage) {
+      const inputCost = (tokenUsage.prompt / 1_000_000) * CONSTANTS.PRICING_INPUT_PER_M;
+      const outputCost = (tokenUsage.response / 1_000_000) * CONSTANTS.PRICING_OUTPUT_PER_M;
+      const totalCost = inputCost + outputCost;
+      const costStr = totalCost < 0.001 ? "<$0.001" : `~$${totalCost.toFixed(3)}`;
+      lines.push(`\n📊 Total tokens: ${tokenUsage.total.toLocaleString()} (prompt: ${tokenUsage.prompt.toLocaleString()}, response: ${tokenUsage.response.toLocaleString()}) — est. ${costStr}`);
+    }
+
+    const content: McpContent[] = [
+      { type: "text", text: lines.join("\n") },
+      ...successes.flatMap(s => s.imageContent),
+    ];
+    return { content };
   }
 
   private async opEditImage(args: { imagePath: string; prompt: string; referenceImages?: string[] }): Promise<CallToolResult> {
@@ -1043,8 +1149,69 @@ export class NanoBananaMCP {
     return { content: [{ type: "text", text: `${header}\n\n${details.join("\n")}` }] };
   }
 
+  private async opGetImageHistory(args: { imagePath: string }): Promise<CallToolResult> {
+    type ChainEntry = { filePath: string; sidecar: ImageSidecar | null; exists: boolean };
+    const chain: ChainEntry[] = [];
+    const visited = new Set<string>();
+    let current = path.resolve(args.imagePath);
+
+    while (current && !visited.has(current)) {
+      visited.add(current);
+
+      let exists = true;
+      try { await fs.access(current); } catch { exists = false; }
+
+      const sidecar = exists ? await this.readImageSidecar(current) : null;
+      chain.push({ filePath: current, sidecar, exists });
+
+      const next = sidecar?.sourceImage ? path.resolve(sidecar.sourceImage) : null;
+      if (!next) break;
+      current = next;
+    }
+
+    // Oldest first
+    chain.reverse();
+
+    if (chain.length === 1 && !chain[0].sidecar) {
+      return {
+        content: [{
+          type: "text",
+          text: `No history found for: ${args.imagePath}\n\nThis image has no metadata sidecar — it may have been generated before v1.2.0, or the sidecar was deleted.`,
+        }],
+      };
+    }
+
+    const targetPath = path.resolve(args.imagePath);
+    const lines: string[] = [
+      `Edit history for: ${args.imagePath}`,
+      `${chain.length} image(s) in chain:`,
+      "",
+    ];
+
+    chain.forEach(({ filePath, sidecar, exists }, i) => {
+      const label = i === 0 ? "Original" : `Edit ${i}`;
+      const currentMarker = filePath === targetPath ? " ← current" : "";
+      const missingMarker = exists ? "" : " (file missing)";
+      lines.push(`${i + 1}. [${label}]${currentMarker}${missingMarker}`);
+      lines.push(`   Path: ${filePath}`);
+      if (sidecar) {
+        lines.push(`   Prompt: "${sidecar.prompt}"`);
+        lines.push(`   Model: ${sidecar.model}`);
+        lines.push(`   Time: ${new Date(sidecar.timestamp).toLocaleString()}`);
+        if (sidecar.tokenUsage?.total) {
+          lines.push(`   Tokens: ${sidecar.tokenUsage.total.toLocaleString()}`);
+        }
+      } else {
+        lines.push("   (no metadata available)");
+      }
+      lines.push("");
+    });
+
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+
   public async run(): Promise<void> {
-    log.info("nano-banana-mcp v1.2.0 starting", { logLevel: log.levelName });
+    log.info("nano-banana-mcp v1.3.0 starting", { logLevel: log.levelName });
     await this.loadConfig();
     await this.loadSession();
     const transport = new StdioServerTransport();

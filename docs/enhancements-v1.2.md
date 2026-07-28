@@ -142,10 +142,15 @@ These join the existing `GEMINI_API_KEY`, `NANO_BANANA_MODEL`, `NANO_BANANA_OUTP
 
 ---
 
-## Items Not Implemented in v1.2
+## Items Implemented in v1.3.0
 
 | Enhancement | Notes |
 |-------------|-------|
-| `generate_image_batch` | Deferred — risk of runaway API costs; needs budget-cap design |
-| Edit chain tracking (`get_image_history`) | `sourceImage` in sidecar is the foundation; walk is not yet exposed |
-| API key format validation on startup | Low priority; `classifyApiError` gives actionable auth errors at call time |
+| `generate_image_batch` | Hard cap at 5, parallel execution, partial successes, aggregated cost |
+| `get_image_history` | Walks sidecar chain oldest-first, handles missing files and cycles |
+
+## Items Implemented in v1.2.1
+
+| Enhancement | Notes |
+|-------------|-------|
+| API key format validation on startup | Warns on wrong prefix or length at every load point |
