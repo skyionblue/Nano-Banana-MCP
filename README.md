@@ -20,6 +20,10 @@ A Model Context Protocol (MCP) server that provides AI image generation and edit
 - ⏮️ **Revert to Original**: Jump straight back to the root of any edit chain in one call
 - 🔄 **Clear Session**: Reset the continue_editing target without deleting any files
 - 📤 **Export Images**: Copy a curated selection of results to any directory
+- 🔬 **Compare Images**: Ask Gemini for a detailed side-by-side comparison of two images
+- 🏆 **Rate Images**: Ask Gemini to rank a set of images by any criterion; optionally auto-select the winner
+- 🧹 **Cleanup Old Images**: Delete images older than N days with a safe dry-run preview
+- 📈 **Session Summary**: Compact overview of config, session target, image count, and disk usage
 - ✨ **Enhance Prompts**: Use Gemini to expand rough prompts into detailed, high-quality prompts
 - 📋 **Image Listing**: Browse all generated images with operation/date filtering and the prompt that created each one
 - 📊 **Token & Cost Reporting**: See token counts and estimated cost in every response
@@ -298,6 +302,47 @@ execute({
     "imagePaths": ["/path/to/a.png", "/path/to/b.png"]
   }
 })
+```
+
+### `compare_images`
+Ask Gemini to produce a structured comparison of two images (similarities, differences, recommendation). Uses the text model — fast and cheap. Optionally focus on a specific aspect.
+```json
+execute({
+  "operation": "compare_images",
+  "arguments": {
+    "imagePathA": "/path/to/a.png",
+    "imagePathB": "/path/to/b.png",
+    "focus": "color palette"
+  }
+})
+```
+
+### `rate_images`
+Ask Gemini to rank 2–10 images from best to worst against a criterion. Set `setWinnerAsTarget: true` to automatically make the top result the session target for `continue_editing`.
+```json
+execute({
+  "operation": "rate_images",
+  "arguments": {
+    "imagePaths": ["/path/a.png", "/path/b.png", "/path/c.png"],
+    "criterion": "most suitable for a homepage hero image",
+    "setWinnerAsTarget": true
+  }
+})
+```
+
+### `cleanup_old_images`
+Delete images older than N days from the output directory. Defaults to dry-run — set `dryRun: false` to actually delete.
+```json
+execute({
+  "operation": "cleanup_old_images",
+  "arguments": {"olderThanDays": 30, "dryRun": false}
+})
+```
+
+### `get_session_summary`
+Compact overview of active config, session target, total images on disk, and disk usage.
+```json
+execute({"operation": "get_session_summary", "arguments": {}})
 ```
 
 ## ⚙️ Configuration Priority

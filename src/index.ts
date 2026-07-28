@@ -192,7 +192,7 @@ export class NanoBananaMCP {
 
   constructor() {
     this.server = new Server(
-      { name: "nano-banana-mcp", version: "1.4.0" },
+      { name: "nano-banana-mcp", version: "1.5.0" },
       { capabilities: { tools: {} } }
     );
 
@@ -311,6 +311,41 @@ export class NanoBananaMCP {
           imagePaths: { type: "array", items: { type: "string" }, description: "Specific image file paths to export. Omit to export all images in the output directory.", required: false },
         },
         handler: (args) => this.opExportImages(args as { outputDir: string; imagePaths?: string[] }),
+      },
+      compare_images: {
+        description: "Use Gemini to produce a detailed visual comparison of two images — similarities, differences, and a recommendation. Uses the text model, so it is fast and cheap.",
+        tags: ["compare", "diff", "analyze", "visual", "gemini", "text"],
+        params: {
+          imagePathA: { type: "string", description: "Full file path to the first image", required: true },
+          imagePathB: { type: "string", description: "Full file path to the second image", required: true },
+          focus: { type: "string", description: "Optional aspect to focus on, e.g. \"color palette\", \"composition\", \"lighting\". Omit for a full comparison.", required: false },
+        },
+        handler: (args) => this.opCompareImages(args as { imagePathA: string; imagePathB: string; focus?: string }),
+      },
+      rate_images: {
+        description: "Use Gemini to rank a list of images from best to worst against a criterion. Returns a ranked list with reasoning. Optionally sets the top-ranked image as the session target.",
+        tags: ["rate", "rank", "score", "compare", "analyze", "gemini", "batch"],
+        params: {
+          imagePaths: { type: "array", items: { type: "string" }, description: "File paths of the images to rank (2–10)", required: true },
+          criterion: { type: "string", description: "What to rank by, e.g. \"most photorealistic\", \"best composition\", \"most suitable for a homepage hero\". Defaults to overall quality.", required: false },
+          setWinnerAsTarget: { type: "boolean", description: "If true, sets the top-ranked image as the session target for continue_editing (default: false)", required: false },
+        },
+        handler: (args) => this.opRateImages(args as { imagePaths: string[]; criterion?: string; setWinnerAsTarget?: boolean }),
+      },
+      cleanup_old_images: {
+        description: "Delete images (and their sidecars) from the output directory that are older than a given number of days. Defaults to dry-run mode — set dryRun: false to actually delete.",
+        tags: ["cleanup", "delete", "old", "housekeeping", "maintenance", "files"],
+        params: {
+          olderThanDays: { type: "number", description: "Delete images last modified more than this many days ago", required: true },
+          dryRun: { type: "boolean", description: "If true (default), only list what would be deleted without actually deleting anything", required: false },
+        },
+        handler: (args) => this.opCleanupOldImages(args as { olderThanDays: number; dryRun?: boolean }),
+      },
+      get_session_summary: {
+        description: "Return a compact summary of the current session: active config, session target, total image count and disk usage in the output directory.",
+        tags: ["session", "summary", "status", "stats", "info"],
+        params: {},
+        handler: () => this.opGetSessionSummary(),
       },
     };
 
@@ -1418,8 +1453,253 @@ export class NanoBananaMCP {
     return { content: [{ type: "text", text: lines.join("\n") }] };
   }
 
+  private async callTextModel(instruction: string, imageParts: { data: string; mimeType: string }[]): Promise<string> {
+    const parts: ContentPart[] = [
+      ...imageParts.map(p => ({ inlineData: { data: p.data, mimeType: p.mimeType } })),
+      { text: instruction },
+    ];
+    const response = await this.withRetry(
+      () => this.withTimeout(
+        this.genAI!.models.generateContent({ model: CONSTANTS.TEXT_MODEL, contents: [{ parts }] }),
+        this.config!.timeoutMs,
+        "text_model"
+      ),
+      "text_model"
+    );
+    const text = (response.candidates?.[0]?.content?.parts ?? [])
+      .filter((p): p is { text: string } => typeof p.text === "string")
+      .map(p => p.text)
+      .join("")
+      .trim();
+    if (!text) throw new McpError(ErrorCode.InternalError, "Gemini returned no text — try again.");
+    return text;
+  }
+
+  private async loadImagePart(imagePath: string): Promise<{ data: string; mimeType: string }> {
+    this.validateImagePath(imagePath);
+    const bytes = await fs.readFile(imagePath);
+    return { data: bytes.toString("base64"), mimeType: this.getMimeType(imagePath) };
+  }
+
+  private async opCompareImages(args: { imagePathA: string; imagePathB: string; focus?: string }): Promise<CallToolResult> {
+    this.ensureConfigured();
+    log.info("compare_images", { a: args.imagePathA, b: args.imagePathB, focus: args.focus });
+
+    let partA: { data: string; mimeType: string };
+    let partB: { data: string; mimeType: string };
+    try {
+      [partA, partB] = await Promise.all([
+        this.loadImagePart(args.imagePathA),
+        this.loadImagePart(args.imagePathB),
+      ]);
+    } catch (err) {
+      throw new McpError(ErrorCode.InvalidParams,
+        `Could not load image: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    const focusLine = args.focus
+      ? `Focus your comparison specifically on: ${args.focus}.`
+      : "Compare all aspects: composition, color palette, lighting, style, and technical quality.";
+
+    const instruction = [
+      "You are a visual analyst. The user has provided two images (Image 1 and Image 2).",
+      focusLine,
+      "Structure your response as:",
+      "**Similarities** — what the two images share",
+      "**Differences** — how they differ",
+      "**Recommendation** — which is stronger and why (one sentence)",
+    ].join("\n");
+
+    try {
+      const result = await this.callTextModel(instruction, [partA, partB]);
+      return {
+        content: [{
+          type: "text",
+          text: `Comparison: ${args.imagePathA} vs ${args.imagePathB}\n\n${result}`,
+        }],
+      };
+    } catch (error) {
+      throw classifyApiError(error, "compare_images");
+    }
+  }
+
+  private async opRateImages(args: { imagePaths: string[]; criterion?: string; setWinnerAsTarget?: boolean }): Promise<CallToolResult> {
+    this.ensureConfigured();
+
+    if (args.imagePaths.length < 2) {
+      throw new McpError(ErrorCode.InvalidParams, "rate_images requires at least 2 image paths.");
+    }
+    if (args.imagePaths.length > 10) {
+      throw new McpError(ErrorCode.InvalidParams, "rate_images accepts at most 10 images at once.");
+    }
+
+    log.info("rate_images", { count: args.imagePaths.length, criterion: args.criterion });
+
+    const loadResults = await Promise.allSettled(args.imagePaths.map(p => this.loadImagePart(p)));
+    const loaded: Array<{ path: string; part: { data: string; mimeType: string } }> = [];
+    for (let i = 0; i < loadResults.length; i++) {
+      const r = loadResults[i];
+      if (r.status === "fulfilled") {
+        loaded.push({ path: args.imagePaths[i], part: r.value });
+      } else {
+        log.warn("rate_images: skipping unreadable image", { path: args.imagePaths[i], error: r.reason instanceof Error ? r.reason.message : String(r.reason) });
+      }
+    }
+
+    if (loaded.length < 2) {
+      throw new McpError(ErrorCode.InvalidRequest, "At least 2 images must be readable to rank them.");
+    }
+
+    const criterionLine = args.criterion
+      ? `Rank them by: ${args.criterion}.`
+      : "Rank them by overall visual quality — composition, color, clarity, and impact.";
+
+    const imageLabels = loaded.map((_, i) => `Image ${i + 1}`).join(", ");
+    const instruction = [
+      `You are a visual art critic. The user has provided ${loaded.length} images (${imageLabels}).`,
+      criterionLine,
+      "Return your ranking from best (#1) to worst. For each image state:",
+      "  Rank, Image number, one-sentence reason.",
+      "End with a one-sentence overall summary.",
+    ].join("\n");
+
+    try {
+      const result = await this.callTextModel(instruction, loaded.map(l => l.part));
+
+      // Map "Image N" labels back to file paths in the response
+      let annotated = result;
+      loaded.forEach(({ path: p }, i) => {
+        annotated = annotated.replace(new RegExp(`Image ${i + 1}\\b`, "g"), `Image ${i + 1} (${path.basename(p)})`);
+      });
+
+      // Determine winner: find the image labelled rank #1
+      const winnerIndex = (() => {
+        for (let i = 0; i < loaded.length; i++) {
+          if (result.includes(`#1`) && result.indexOf(`Image ${i + 1}`) < result.indexOf("#1") + 20) return i;
+          if (result.match(new RegExp(`1[.)\\s].*Image ${i + 1}`))) return i;
+        }
+        return 0;
+      })();
+
+      if (args.setWinnerAsTarget && loaded[winnerIndex]) {
+        this.lastImagePath = loaded[winnerIndex].path;
+        await this.saveSession();
+        annotated += `\n\n✅ Session target set to winner: ${loaded[winnerIndex].path}`;
+      }
+
+      const skipped = args.imagePaths.length - loaded.length;
+      const header = [
+        `Ranked ${loaded.length} image(s) by: ${args.criterion ?? "overall quality"}`,
+        skipped > 0 ? `(${skipped} image(s) skipped — could not be read)` : "",
+        "",
+      ].filter(Boolean).join("\n");
+
+      return { content: [{ type: "text", text: header + annotated }] };
+    } catch (error) {
+      throw classifyApiError(error, "rate_images");
+    }
+  }
+
+  private async opCleanupOldImages(args: { olderThanDays: number; dryRun?: boolean }): Promise<CallToolResult> {
+    const dryRun = args.dryRun !== false; // default true
+    const cutoff = new Date(Date.now() - args.olderThanDays * 24 * 60 * 60 * 1000);
+    const imagesDir = this.getImagesDirectory();
+
+    try { await fs.access(imagesDir); } catch {
+      return { content: [{ type: "text", text: `No output directory found at: ${imagesDir}` }] };
+    }
+
+    const entries = await fs.readdir(imagesDir, { withFileTypes: true });
+    const imageFiles = entries.filter(e => e.isFile() && /\.(png|jpe?g|webp)$/i.test(e.name));
+
+    const candidates: Array<{ filePath: string; sizeKb: number; mtime: Date }> = [];
+    for (const entry of imageFiles) {
+      const fullPath = path.join(imagesDir, entry.name);
+      const stats = await fs.stat(fullPath);
+      if (stats.mtime < cutoff) {
+        candidates.push({ filePath: fullPath, sizeKb: Math.round(stats.size / 1024), mtime: stats.mtime });
+      }
+    }
+
+    if (candidates.length === 0) {
+      return {
+        content: [{ type: "text", text: `No images older than ${args.olderThanDays} day(s) found in ${imagesDir}.` }],
+      };
+    }
+
+    const totalKb = candidates.reduce((s, c) => s + c.sizeKb, 0);
+
+    if (dryRun) {
+      const lines = [
+        `Dry run — ${candidates.length} image(s) would be deleted (${totalKb} KB total):`,
+        "",
+        ...candidates.map(c => `- ${c.filePath} (${c.sizeKb} KB, last modified ${c.mtime.toLocaleDateString()})`),
+        "",
+        `Run with dryRun: false to permanently delete these files.`,
+      ];
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+
+    let deleted = 0;
+    const failed: string[] = [];
+    for (const { filePath } of candidates) {
+      try {
+        await fs.unlink(filePath);
+        deleted++;
+        log.info("Cleanup: deleted image", { path: filePath });
+        try { await fs.unlink(this.sidecarPath(filePath)); } catch { /* no sidecar is fine */ }
+        if (this.lastImagePath === filePath) {
+          this.lastImagePath = null;
+          await this.saveSession();
+        }
+      } catch (err) {
+        failed.push(path.basename(filePath));
+        log.warn("Cleanup: failed to delete", { path: filePath, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    const lines = [`Deleted ${deleted} image(s) older than ${args.olderThanDays} day(s) (${totalKb} KB freed).`];
+    if (failed.length > 0) {
+      lines.push(`\n⚠️  Could not delete ${failed.length} file(s):\n${failed.map(n => `- ${n}`).join("\n")}`);
+    }
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+
+  private async opGetSessionSummary(): Promise<CallToolResult> {
+    const imagesDir = this.getImagesDirectory();
+    let imageCount = 0;
+    let totalKb = 0;
+
+    try {
+      const entries = await fs.readdir(imagesDir, { withFileTypes: true });
+      const imageFiles = entries.filter(e => e.isFile() && /\.(png|jpe?g|webp)$/i.test(e.name));
+      imageCount = imageFiles.length;
+      const stats = await Promise.all(imageFiles.map(e => fs.stat(path.join(imagesDir, e.name))));
+      totalKb = Math.round(stats.reduce((s, st) => s + st.size, 0) / 1024);
+    } catch { /* directory doesn't exist yet */ }
+
+    const isConfigured = this.config !== null;
+    const lines: string[] = [
+      "── Session Summary ──────────────────────",
+      `Config:         ${isConfigured ? `✅ ${this.configSource}` : "❌ not configured"}`,
+    ];
+
+    if (isConfigured) {
+      lines.push(`Model:          ${this.config!.model}`);
+      lines.push(`Output dir:     ${imagesDir}`);
+      lines.push(`Output format:  ${this.config!.outputFormat}`);
+    }
+
+    lines.push(`Session target: ${this.lastImagePath ?? "(none)"}`);
+    lines.push(`Images on disk: ${imageCount} file(s), ${totalKb} KB`);
+    lines.push(`Log level:      ${log.levelName}`);
+    lines.push("─────────────────────────────────────────");
+
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+
   public async run(): Promise<void> {
-    log.info("nano-banana-mcp v1.4.0 starting", { logLevel: log.levelName });
+    log.info("nano-banana-mcp v1.5.0 starting", { logLevel: log.levelName });
     await this.loadConfig();
     await this.loadSession();
     const transport = new StdioServerTransport();

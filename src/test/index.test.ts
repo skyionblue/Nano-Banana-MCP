@@ -2064,3 +2064,315 @@ describe("NanoBananaMCP generate_image_batch with referenceImages", () => {
     expect(coreSpy).toHaveBeenCalledWith("a cat", undefined);
   });
 });
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — compare_images
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP compare_images", () => {
+  let server: NanoBananaMCP;
+  const imgA = path.join(os.homedir(), "a.png");
+  const imgB = path.join(os.homedir(), "b.png");
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+    configureServer(server);
+    stubFsDefaults();
+    vi.mocked(fs.readFile).mockResolvedValue(Buffer.from("fake image bytes"));
+  });
+
+  it("throws InvalidRequest when not configured", async () => {
+    const unconfigured = new NanoBananaMCP();
+    await expect(callExecute(unconfigured, "compare_images", { imagePathA: imgA, imagePathB: imgB }))
+      .rejects.toMatchObject({ code: ErrorCode.InvalidRequest });
+  });
+
+  it("throws InvalidParams when an image path is outside allowed dirs", async () => {
+    await expect(callExecute(server, "compare_images", { imagePathA: "/etc/passwd", imagePathB: imgB }))
+      .rejects.toMatchObject({ code: ErrorCode.InvalidParams });
+  });
+
+  it("returns comparison text from Gemini", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ text: "**Similarities**\nBoth show a sunset.\n**Differences**\nColors differ.\n**Recommendation**\nImage 1 is stronger." }] } }],
+    });
+    const result = await callExecute(server, "compare_images", { imagePathA: imgA, imagePathB: imgB });
+    const text = result.content[0].text as string;
+    expect(text).toContain("Similarities");
+    expect(text).toContain("Differences");
+    expect(text).toContain("Recommendation");
+    expect(text).toContain(imgA);
+    expect(text).toContain(imgB);
+  });
+
+  it("sends both images to the TEXT_MODEL", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ text: "comparison result" }] } }],
+    });
+    await callExecute(server, "compare_images", { imagePathA: imgA, imagePathB: imgB });
+    const call = mockGenerateContent.mock.calls[0][0];
+    expect(call.model).toBe(CONSTANTS.TEXT_MODEL);
+    const imageParts = call.contents[0].parts.filter((p: any) => p.inlineData);
+    expect(imageParts).toHaveLength(2);
+  });
+
+  it("includes focus hint in the instruction when provided", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ text: "focused comparison" }] } }],
+    });
+    await callExecute(server, "compare_images", { imagePathA: imgA, imagePathB: imgB, focus: "color palette" });
+    const instruction = mockGenerateContent.mock.calls[0][0].contents[0].parts.at(-1).text as string;
+    expect(instruction).toContain("color palette");
+  });
+
+  it("classifies API errors", async () => {
+    mockGenerateContent.mockRejectedValue(new Error("429 Too Many Requests"));
+    await expect(callExecute(server, "compare_images", { imagePathA: imgA, imagePathB: imgB }))
+      .rejects.toMatchObject({ code: ErrorCode.InternalError });
+  });
+});
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — rate_images
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP rate_images", () => {
+  let server: NanoBananaMCP;
+  const imgs = Array.from({ length: 3 }, (_, i) => path.join(os.homedir(), `img${i + 1}.png`));
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+    configureServer(server);
+    stubFsDefaults();
+    vi.mocked(fs.readFile).mockResolvedValue(Buffer.from("fake bytes"));
+  });
+
+  it("throws InvalidRequest when not configured", async () => {
+    const unconfigured = new NanoBananaMCP();
+    await expect(callExecute(unconfigured, "rate_images", { imagePaths: imgs }))
+      .rejects.toMatchObject({ code: ErrorCode.InvalidRequest });
+  });
+
+  it("throws InvalidParams when fewer than 2 paths provided", async () => {
+    await expect(callExecute(server, "rate_images", { imagePaths: [imgs[0]] }))
+      .rejects.toMatchObject({ code: ErrorCode.InvalidParams });
+  });
+
+  it("throws InvalidParams when more than 10 paths provided", async () => {
+    await expect(callExecute(server, "rate_images", { imagePaths: Array(11).fill(imgs[0]) }))
+      .rejects.toMatchObject({ code: ErrorCode.InvalidParams });
+  });
+
+  it("returns a ranking with filenames substituted for image labels", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ text: "#1 Image 2 — best composition.\n#2 Image 1 — decent.\n#3 Image 3 — weakest." }] } }],
+    });
+    const result = await callExecute(server, "rate_images", { imagePaths: imgs });
+    expect(result.content[0].text).toContain("#1");
+    expect(result.content[0].text).toContain("img2.png");
+  });
+
+  it("sends all images to the TEXT_MODEL", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ text: "#1 Image 1" }] } }],
+    });
+    await callExecute(server, "rate_images", { imagePaths: imgs });
+    const call = mockGenerateContent.mock.calls[0][0];
+    expect(call.model).toBe(CONSTANTS.TEXT_MODEL);
+    const imageParts = call.contents[0].parts.filter((p: any) => p.inlineData);
+    expect(imageParts).toHaveLength(3);
+  });
+
+  it("includes criterion in the instruction when provided", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ text: "#1 Image 1" }] } }],
+    });
+    await callExecute(server, "rate_images", { imagePaths: imgs, criterion: "most photorealistic" });
+    const instruction = mockGenerateContent.mock.calls[0][0].contents[0].parts.at(-1).text as string;
+    expect(instruction).toContain("most photorealistic");
+  });
+
+  it("skips unreadable images and continues when 2+ remain", async () => {
+    vi.mocked(fs.readFile).mockImplementation(async (p: any) => {
+      if (String(p).endsWith("img3.png")) throw new Error("ENOENT");
+      return Buffer.from("bytes");
+    });
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ text: "#1 Image 1\n#2 Image 2" }] } }],
+    });
+    const result = await callExecute(server, "rate_images", { imagePaths: imgs });
+    expect(result.content[0].text).toContain("skipped");
+  });
+
+  it("throws InvalidRequest when fewer than 2 images are readable", async () => {
+    vi.mocked(fs.readFile).mockRejectedValue(new Error("ENOENT"));
+    await expect(callExecute(server, "rate_images", { imagePaths: imgs }))
+      .rejects.toMatchObject({ code: ErrorCode.InvalidRequest });
+  });
+
+  it("saves session and notes winner when setWinnerAsTarget is true", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ text: "#1 Image 2 — best.\n#2 Image 1.\n#3 Image 3." }] } }],
+    });
+    const result = await callExecute(server, "rate_images", { imagePaths: imgs, setWinnerAsTarget: true });
+    expect((server as any).lastImagePath).not.toBeNull();
+    expect(result.content[0].text).toContain("Session target set");
+    const sessionCall = vi.mocked(fs.writeFile).mock.calls.find(([p]) =>
+      String(p).endsWith(".nano-banana-session.json")
+    );
+    expect(sessionCall).toBeDefined();
+  });
+
+  it("does not change session target when setWinnerAsTarget is false", async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ text: "#1 Image 1" }] } }],
+    });
+    (server as any).lastImagePath = null;
+    await callExecute(server, "rate_images", { imagePaths: imgs, setWinnerAsTarget: false });
+    expect((server as any).lastImagePath).toBeNull();
+  });
+});
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — cleanup_old_images
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP cleanup_old_images", () => {
+  let server: NanoBananaMCP;
+  let imagesDir: string;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+    configureServer(server);
+    stubFsDefaults();
+    imagesDir = (server as any).getImagesDirectory();
+  });
+
+  it("returns no-directory message when output dir does not exist", async () => {
+    vi.mocked(fs.access).mockRejectedValue(new Error("ENOENT"));
+    const result = await callExecute(server, "cleanup_old_images", { olderThanDays: 7 });
+    expect(result.content[0].text).toContain("No output directory");
+  });
+
+  it("returns no-candidates message when no images are old enough", async () => {
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+    vi.mocked(fs.readdir).mockResolvedValue([
+      { name: "recent.png", isFile: () => true } as any,
+    ]);
+    vi.mocked(fs.stat).mockResolvedValue({ size: 1024, mtime: new Date() } as any);
+    const result = await callExecute(server, "cleanup_old_images", { olderThanDays: 7 });
+    expect(result.content[0].text).toContain("No images older than");
+  });
+
+  it("dry-run lists candidates without deleting (default behaviour)", async () => {
+    const oldDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+    vi.mocked(fs.readdir).mockResolvedValue([
+      { name: "old.png", isFile: () => true } as any,
+    ]);
+    vi.mocked(fs.stat).mockResolvedValue({ size: 51200, mtime: oldDate } as any);
+    const result = await callExecute(server, "cleanup_old_images", { olderThanDays: 7 });
+    expect(result.content[0].text).toContain("Dry run");
+    expect(result.content[0].text).toContain("old.png");
+    expect(result.content[0].text).toContain("dryRun: false");
+    expect(fs.unlink).not.toHaveBeenCalled();
+  });
+
+  it("deletes old images and their sidecars when dryRun is false", async () => {
+    const oldDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+    vi.mocked(fs.readdir).mockResolvedValue([
+      { name: "old.png", isFile: () => true } as any,
+    ]);
+    vi.mocked(fs.stat).mockResolvedValue({ size: 1024, mtime: oldDate } as any);
+    const result = await callExecute(server, "cleanup_old_images", { olderThanDays: 7, dryRun: false });
+    expect(fs.unlink).toHaveBeenCalledWith(path.join(imagesDir, "old.png"));
+    expect(result.content[0].text).toContain("Deleted 1 image");
+  });
+
+  it("preserves recent images when deleting", async () => {
+    const oldDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+    vi.mocked(fs.readdir).mockResolvedValue([
+      { name: "recent.png", isFile: () => true } as any,
+      { name: "old.png", isFile: () => true } as any,
+    ]);
+    vi.mocked(fs.stat).mockImplementation(async (p: any) => ({
+      size: 1024,
+      mtime: String(p).endsWith("old.png") ? oldDate : new Date(),
+    } as any));
+    await callExecute(server, "cleanup_old_images", { olderThanDays: 7, dryRun: false });
+    const deletedPaths = vi.mocked(fs.unlink).mock.calls.map(([p]) => String(p));
+    expect(deletedPaths.some(p => p.endsWith("recent.png"))).toBe(false);
+    expect(deletedPaths.some(p => p.endsWith("old.png"))).toBe(true);
+  });
+
+  it("clears session target when the deleted file was the last image", async () => {
+    const oldDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+    const targetPath = path.join(imagesDir, "old.png");
+    (server as any).lastImagePath = targetPath;
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+    vi.mocked(fs.readdir).mockResolvedValue([
+      { name: "old.png", isFile: () => true } as any,
+    ]);
+    vi.mocked(fs.stat).mockResolvedValue({ size: 1024, mtime: oldDate } as any);
+    await callExecute(server, "cleanup_old_images", { olderThanDays: 7, dryRun: false });
+    expect((server as any).lastImagePath).toBeNull();
+  });
+});
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — get_session_summary
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP get_session_summary", () => {
+  let server: NanoBananaMCP;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+    stubFsDefaults();
+  });
+
+  it("shows not-configured state when no key is set", async () => {
+    vi.mocked(fs.readdir).mockResolvedValue([] as any);
+    const result = await callExecute(server, "get_session_summary", {});
+    expect(result.content[0].text).toContain("not configured");
+  });
+
+  it("shows configured state with model and output dir", async () => {
+    configureServer(server);
+    vi.mocked(fs.readdir).mockResolvedValue([] as any);
+    const result = await callExecute(server, "get_session_summary", {});
+    const text = result.content[0].text as string;
+    expect(text).toContain("✅");
+    expect(text).toContain(CONSTANTS.MODEL);
+  });
+
+  it("shows the current session target when one is set", async () => {
+    configureServer(server);
+    (server as any).lastImagePath = path.join(os.homedir(), "last.png");
+    vi.mocked(fs.readdir).mockResolvedValue([] as any);
+    const result = await callExecute(server, "get_session_summary", {});
+    expect(result.content[0].text).toContain("last.png");
+  });
+
+  it("shows image count and total disk usage", async () => {
+    configureServer(server);
+    vi.mocked(fs.readdir).mockResolvedValue([
+      { name: "a.png", isFile: () => true } as any,
+      { name: "b.png", isFile: () => true } as any,
+    ]);
+    vi.mocked(fs.stat).mockResolvedValue({ size: 102400, mtime: new Date() } as any);
+    const result = await callExecute(server, "get_session_summary", {});
+    const text = result.content[0].text as string;
+    expect(text).toContain("2 file(s)");
+    expect(text).toContain("200 KB");
+  });
+
+  it("handles a missing output directory gracefully", async () => {
+    configureServer(server);
+    vi.mocked(fs.readdir).mockRejectedValue(new Error("ENOENT"));
+    const result = await callExecute(server, "get_session_summary", {});
+    expect(result.content[0].text).toContain("0 file(s)");
+  });
+});
