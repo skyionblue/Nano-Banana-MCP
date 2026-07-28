@@ -153,4 +153,4 @@ These join the existing `GEMINI_API_KEY`, `NANO_BANANA_MODEL`, `NANO_BANANA_OUTP
 
 | Enhancement | Notes |
 |-------------|-------|
-| API key format validation on startup | Warns on wrong prefix or length at every load point |
+| API key format validation on startup | Warns on wrong prefix or length at every load point; surfaced in configure_gemini_token response |
