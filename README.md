@@ -28,11 +28,13 @@ A Model Context Protocol (MCP) server that provides AI image generation and edit
 
 1. **Get your Gemini API key**:
    - Visit [Google AI Studio](https://aistudio.google.com/app/apikey)
-   - Create a new API key
+   - Create a new API key — it will start with `AIza` and be 39 characters long
    - Copy it for configuration
 
 2. **Configure the MCP server**:
    See configuration examples for your specific client below (Claude Code, Cursor, or other MCP clients).
+
+> **Tip:** nano-banana validates your API key format on startup. If the key looks wrong (wrong prefix or length), a warning is written to the server log and surfaced in the `configure_gemini_token` response — so you'll know immediately instead of getting a confusing auth error on the first image generation.
 
 ## 💻 Usage with Claude Code
 

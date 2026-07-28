@@ -31,6 +31,7 @@ import * as fs from "fs/promises";
 import {
   Logger,
   classifyApiError,
+  validateApiKeyFormat,
   ConfigSchema,
   CONSTANTS,
   NanoBananaMCP,
@@ -461,14 +462,15 @@ describe("NanoBananaMCP configure_gemini_token", () => {
   });
 
   it("sets config and genAI and returns success message", async () => {
-    const result = await callExecute(server, "configure_gemini_token", { apiKey: "test-key-123" });
+    const validKey = "AIza" + "A".repeat(35);
+    const result = await callExecute(server, "configure_gemini_token", { apiKey: validKey });
     expect(result.content[0].text).toContain("configured successfully");
     expect((server as any).config).not.toBeNull();
     expect((server as any).genAI).not.toBeNull();
   });
 
   it("saves config to file with restricted permissions", async () => {
-    await callExecute(server, "configure_gemini_token", { apiKey: "test-key-123" });
+    await callExecute(server, "configure_gemini_token", { apiKey: "AIza" + "A".repeat(35) });
     expect(fs.writeFile).toHaveBeenCalledWith(
       expect.stringContaining(".nano-banana-config.json"),
       expect.any(String),
@@ -1623,5 +1625,91 @@ describe("NanoBananaMCP get_image_history", () => {
     await expect(
       callExecute(server, "get_image_history", { imagePath: a })
     ).resolves.toBeDefined();
+  });
+});
+
+// -------------------------------------------------------------------
+// validateApiKeyFormat
+// -------------------------------------------------------------------
+
+describe("validateApiKeyFormat", () => {
+  const validKey = "AIza" + "A".repeat(35);
+
+  it("returns valid:true for a correctly formatted key", () => {
+    expect(validateApiKeyFormat(validKey).valid).toBe(true);
+    expect(validateApiKeyFormat(validKey).warning).toBeUndefined();
+  });
+
+  it("returns valid:false when key does not start with 'AIza'", () => {
+    const result = validateApiKeyFormat("XYza" + "A".repeat(35));
+    expect(result.valid).toBe(false);
+    expect(result.warning).toContain("AIza");
+    expect(result.warning).toContain("aistudio.google.com");
+  });
+
+  it("returns valid:false when key is too short", () => {
+    const result = validateApiKeyFormat("AIza" + "A".repeat(10));
+    expect(result.valid).toBe(false);
+    expect(result.warning).toContain("truncated");
+    expect(result.warning).toContain(`${CONSTANTS.API_KEY_LENGTH}`);
+  });
+
+  it("returns valid:false when key is too long", () => {
+    const result = validateApiKeyFormat("AIza" + "A".repeat(50));
+    expect(result.valid).toBe(false);
+    expect(result.warning).toContain("truncated");
+  });
+
+  it("returns valid:false for an empty string", () => {
+    expect(validateApiKeyFormat("").valid).toBe(false);
+  });
+
+  it("reports the actual key length in the warning", () => {
+    const shortKey = "AIzaABC";
+    expect(validateApiKeyFormat(shortKey).warning).toContain(`${shortKey.length} characters`);
+  });
+});
+
+// -------------------------------------------------------------------
+// configure_gemini_token — key format warning surfacing
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP configure_gemini_token key format warnings", () => {
+  let server: NanoBananaMCP;
+  let stderrSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+    stubFsDefaults();
+    stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+  });
+
+  afterEach(() => {
+    stderrSpy.mockRestore();
+  });
+
+  it("returns a clean success message for a well-formed key", async () => {
+    const goodKey = "AIza" + "A".repeat(35);
+    const result = await callExecute(server, "configure_gemini_token", { apiKey: goodKey });
+    expect(result.content[0].text).toContain("configured successfully");
+    expect(result.content[0].text).not.toContain("⚠️");
+  });
+
+  it("includes a warning in the response text for a malformed key", async () => {
+    const result = await callExecute(server, "configure_gemini_token", { apiKey: "not-a-real-key" });
+    expect(result.content[0].text).toContain("⚠️");
+    expect(result.content[0].text).toContain("aistudio.google.com");
+  });
+
+  it("logs the format warning to stderr for a malformed key", async () => {
+    await callExecute(server, "configure_gemini_token", { apiKey: "not-a-real-key" });
+    const output = stderrSpy.mock.calls.map(([m]) => String(m)).join("");
+    expect(output).toContain("API key format warning");
+  });
+
+  it("does not log a format warning to stderr for a well-formed key", async () => {
+    await callExecute(server, "configure_gemini_token", { apiKey: "AIza" + "A".repeat(35) });
+    const output = stderrSpy.mock.calls.map(([m]) => String(m)).join("");
+    expect(output).not.toContain("API key format warning");
   });
 });

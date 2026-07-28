@@ -28,6 +28,9 @@ export const CONSTANTS = {
   PRICING_INPUT_PER_M: 0.075,
   PRICING_OUTPUT_PER_M: 0.30,
   BATCH_MAX_COUNT: 5,
+  // Google AI Studio keys start with "AIza" and are 39 chars long
+  API_KEY_PREFIX: "AIza",
+  API_KEY_LENGTH: 39,
 } as const;
 
 // --- Logger ---
@@ -58,6 +61,24 @@ export class Logger {
 }
 
 export const log = new Logger();
+
+// --- API key format validation ---
+
+export function validateApiKeyFormat(apiKey: string): { valid: boolean; warning?: string } {
+  if (!apiKey.startsWith(CONSTANTS.API_KEY_PREFIX)) {
+    return {
+      valid: false,
+      warning: `API key does not start with "${CONSTANTS.API_KEY_PREFIX}" — this may not be a valid Google AI Studio key. Get one at aistudio.google.com/app/apikey.`,
+    };
+  }
+  if (apiKey.length !== CONSTANTS.API_KEY_LENGTH) {
+    return {
+      valid: false,
+      warning: `API key is ${apiKey.length} characters (expected ${CONSTANTS.API_KEY_LENGTH}) — it may have been truncated during copy-paste.`,
+    };
+  }
+  return { valid: true };
+}
 
 // --- Error classification ---
 
@@ -636,6 +657,8 @@ export class NanoBananaMCP {
         this.genAI = new GoogleGenAI({ apiKey: this.config.geminiApiKey });
         this.configSource = "environment";
         log.info("Config loaded from environment variable");
+        const envKeyCheck = validateApiKeyFormat(this.config.geminiApiKey);
+        if (!envKeyCheck.valid) log.warn(`API key format warning: ${envKeyCheck.warning}`);
         log.debug("Active config", {
           model: this.config.model,
           outputFormat: this.config.outputFormat,
@@ -659,6 +682,8 @@ export class NanoBananaMCP {
       this.genAI = new GoogleGenAI({ apiKey: this.config.geminiApiKey });
       this.configSource = "config_file";
       log.info("Config loaded from file", { path: configPath });
+      const fileKeyCheck = validateApiKeyFormat(this.config.geminiApiKey);
+      if (!fileKeyCheck.valid) log.warn(`API key format warning: ${fileKeyCheck.warning}`);
       log.debug("Active config", {
         model: this.config.model,
         outputFormat: this.config.outputFormat,
@@ -682,8 +707,13 @@ export class NanoBananaMCP {
       this.configSource = "config_file";
       await this.saveConfig();
       log.info("API key configured via tool");
+      const keyCheck = validateApiKeyFormat(args.apiKey);
+      if (!keyCheck.valid) log.warn(`API key format warning: ${keyCheck.warning}`);
+      const successText = keyCheck.valid
+        ? "Gemini API token configured successfully! You can now use nano-banana image generation features."
+        : `Gemini API token saved, but there may be a problem with it:\n\n⚠️  ${keyCheck.warning}\n\nIf image generation fails with an auth error, double-check the key at aistudio.google.com/app/apikey.`;
       return {
-        content: [{ type: "text", text: "Gemini API token configured successfully! You can now use nano-banana image generation features." }],
+        content: [{ type: "text", text: successText }],
       };
     } catch (error) {
       if (error instanceof z.ZodError) {
