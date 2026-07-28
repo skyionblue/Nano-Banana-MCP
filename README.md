@@ -12,11 +12,15 @@ A Model Context Protocol (MCP) server that provides AI image generation and edit
 
 - 🎨 **Generate Images**: Create new images from text descriptions
 - ✏️ **Edit Images**: Modify existing images with text prompts
-- 🔄 **Iterative Editing**: Continue editing the last generated/edited image
-- 🖼️ **Multiple Reference Images**: Use reference images for style transfer and guidance
+- 🔄 **Iterative Editing**: Continue editing across sessions — last image is persisted automatically
+- 🖼️ **Multiple Reference Images**: Use reference images for style transfer and content guidance
+- 🗑️ **Delete Images**: Remove generated images and their metadata cleanly
+- ✨ **Enhance Prompts**: Use Gemini to expand rough prompts into detailed, high-quality prompts
+- 📋 **Image Listing**: Browse all generated images with the prompt that created each one
+- 📊 **Token & Cost Reporting**: See token counts and estimated cost in every response
+- 📝 **Metadata Sidecars**: Each saved image gets a JSON companion with prompt, model, and token data
+- ⚙️ **Configurable**: Override model, output directory, format, timeout, and prompt style via env vars
 - 🌍 **Cross-Platform**: Smart file paths for Windows, macOS, and Linux
-- 🔧 **Easy Setup**: Simple configuration with API key
-- 📁 **Auto File Management**: Automatic image saving with organized naming
 
 ## 🔑 Setup
 
@@ -140,53 +144,108 @@ npx nano-banana-mcp
 # This creates a local .nano-banana-config.json file
 ```
 
-## 🛠️ Available Commands
+## 🛠️ How It Works: 2-Tool Design
+
+nano-banana-mcp exposes exactly **2 MCP tools** to keep the tool list loaded into the model's context as small as possible. All operations are discovered and invoked through these two tools.
+
+### `search`
+Discover available operations. Returns names, descriptions, and parameter lists. Supports an optional keyword filter.
+
+```
+search()                    // list all operations
+search({query: "edit"})     // filter by keyword
+```
+
+### `execute`
+Run any operation by name.
+
+```
+execute({operation: "<name>", arguments: {...}})
+```
+
+---
+
+## 📋 Available Operations
+
+Use `search` at any time to see these in the client. Use `execute` to run them.
 
 ### `generate_image`
 Create a new image from a text prompt.
-```typescript
-generate_image({
-  prompt: "A futuristic city at night with neon lights"
+```json
+execute({
+  "operation": "generate_image",
+  "arguments": {"prompt": "A futuristic city at night with neon lights"}
 })
 ```
 
 ### `edit_image`
 Edit a specific image file.
-```typescript
-edit_image({
-  imagePath: "/path/to/image.png",
-  prompt: "Add a rainbow in the sky",
-  referenceImages?: ["/path/to/reference.jpg"] // optional
+```json
+execute({
+  "operation": "edit_image",
+  "arguments": {
+    "imagePath": "/path/to/image.png",
+    "prompt": "Add a rainbow in the sky",
+    "referenceImages": ["/path/to/style.jpg"]
+  }
 })
 ```
 
 ### `continue_editing`
-Continue editing the last generated/edited image.
-```typescript
-continue_editing({
-  prompt: "Make it more colorful",
-  referenceImages?: ["/path/to/style.jpg"] // optional
+Continue editing the last generated/edited image (no file path needed).
+```json
+execute({
+  "operation": "continue_editing",
+  "arguments": {"prompt": "Make it more colorful"}
 })
 ```
 
 ### `get_last_image_info`
-Get information about the last generated image.
-```typescript
-get_last_image_info()
+Get the path, size, and timestamp of the last image.
+```json
+execute({"operation": "get_last_image_info", "arguments": {}})
 ```
 
 ### `configure_gemini_token`
-Configure your Gemini API key.
-```typescript
-configure_gemini_token({
-  apiKey: "your-gemini-api-key"
+Save your Gemini API key to the local config file.
+```json
+execute({
+  "operation": "configure_gemini_token",
+  "arguments": {"apiKey": "your-gemini-api-key"}
 })
 ```
 
 ### `get_configuration_status`
-Check if the API key is configured.
-```typescript
-get_configuration_status()
+Check if the API key is configured and view active settings.
+```json
+execute({"operation": "get_configuration_status", "arguments": {}})
+```
+
+### `delete_image`
+Delete a generated image and its metadata sidecar from the output directory.
+```json
+execute({
+  "operation": "delete_image",
+  "arguments": {"imagePath": "/path/to/image.png"}
+})
+```
+
+### `enhance_prompt`
+Use Gemini to expand a rough prompt into a detailed, high-quality generation prompt.
+```json
+execute({
+  "operation": "enhance_prompt",
+  "arguments": {"prompt": "a cat", "style": "photorealistic"}
+})
+```
+
+### `list_generated_images`
+List previously generated and edited images, sorted newest first. Shows the prompt from each image's metadata sidecar.
+```json
+execute({
+  "operation": "list_generated_images",
+  "arguments": {"limit": 20}
+})
 ```
 
 ## ⚙️ Configuration Priority
@@ -209,6 +268,37 @@ The MCP server loads your API key in the following priority order:
 
 **💡 Recommendation**: Use Method 1 (MCP config env variables) for the best security and convenience.
 
+## 🔩 Advanced Environment Variables
+
+In addition to `GEMINI_API_KEY`, the following variables let you override defaults without touching the config file:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NANO_BANANA_MODEL` | `gemini-2.5-flash-preview-05-20` | Gemini model to use for image generation |
+| `NANO_BANANA_OUTPUT_DIR` | Platform auto-detect (see below) | Directory where images are saved |
+| `NANO_BANANA_OUTPUT_FORMAT` | `png` | Output format: `png`, `jpeg`, or `webp` |
+| `NANO_BANANA_TIMEOUT_MS` | `120000` | API call timeout in milliseconds |
+| `NANO_BANANA_PROMPT_PREFIX` | `""` | Text prepended to every generate/edit prompt |
+| `NANO_BANANA_PROMPT_SUFFIX` | `""` | Text appended to every generate/edit prompt |
+| `NANO_BANANA_LOG_LEVEL` | `WARN` | Log verbosity: `DEBUG`, `INFO`, `WARN`, `ERROR`, or `SILENT` |
+
+Example:
+```json
+{
+  "mcpServers": {
+    "nano-banana": {
+      "command": "npx",
+      "args": ["nano-banana-mcp"],
+      "env": {
+        "GEMINI_API_KEY": "your-key",
+        "NANO_BANANA_OUTPUT_DIR": "/Users/you/images",
+        "NANO_BANANA_OUTPUT_FORMAT": "webp"
+      }
+    }
+  }
+}
+```
+
 ## 📁 File Storage
 
 Images are automatically saved to platform-appropriate locations:
@@ -224,20 +314,30 @@ File naming convention:
 ## 🎨 Example Workflows
 
 ### Basic Image Generation
-1. `generate_image` - Create your base image
-2. `continue_editing` - Refine and improve
-3. `continue_editing` - Add final touches
+```
+search()                                              // discover operations
+execute({operation: "generate_image", arguments: {prompt: "a sunset over mountains"}})
+execute({operation: "continue_editing", arguments: {prompt: "add dramatic clouds"}})
+execute({operation: "continue_editing", arguments: {prompt: "make it golden hour"}})
+```
 
 ### Style Transfer
-1. `generate_image` - Create base content
-2. `edit_image` - Use reference images for style
-3. `continue_editing` - Fine-tune the result
+```
+execute({operation: "generate_image", arguments: {prompt: "portrait of a knight"}})
+execute({operation: "edit_image", arguments: {
+  imagePath: "/path/to/image.png",
+  prompt: "apply impressionist painting style",
+  referenceImages: ["/path/to/monet.jpg"]
+}})
+```
 
 ### Iterative Design
-1. `generate_image` - Start with a concept
-2. `get_last_image_info` - Check current state
-3. `continue_editing` - Make adjustments
-4. Repeat until satisfied
+```
+execute({operation: "generate_image", arguments: {prompt: "app icon concept"}})
+execute({operation: "get_last_image_info", arguments: {}})
+execute({operation: "continue_editing", arguments: {prompt: "make the colors bolder"}})
+execute({operation: "list_generated_images", arguments: {limit: 5}})
+```
 
 ## 🔧 Development
 
