@@ -18,8 +18,10 @@ A Model Context Protocol (MCP) server that provides AI image generation and edit
 - 🎞️ **Batch Generation**: Generate up to 5 variations of a prompt in parallel, with optional shared style references
 - 🔍 **Edit History**: Trace the full edit lineage of any image back to the original
 - ⏮️ **Revert to Original**: Jump straight back to the root of any edit chain in one call
-- 🔄 **Clear Session**: Reset the continue_editing target without deleting any files
-- 📤 **Export Images**: Copy a curated selection of results to any directory
+- 🔄 **Clear/Undo Session**: Reset the target, undo one step, or jump back to the original
+- 📤 **Export & Rename Images**: Copy or rename results with sidecar metadata preserved
+- 🎨 **Style Variations**: Generate prompt variations with distinct style suffixes in one call
+- 🔍 **Categorized Search**: Filter `search` by category to load only the ops you need
 - 🔬 **Compare Images**: Ask Gemini for a detailed side-by-side comparison of two images
 - 🏆 **Rate Images**: Ask Gemini to rank a set of images by any criterion; optionally auto-select the winner
 - 🧹 **Cleanup Old Images**: Delete images older than N days with a safe dry-run preview
@@ -345,6 +347,33 @@ Compact overview of active config, session target, total images on disk, and dis
 execute({"operation": "get_session_summary", "arguments": {}})
 ```
 
+### `generate_variations`
+Generate style variations of the same base prompt in parallel. Each variation appends a style suffix (defaults to warm tones / cool tones / high contrast). Sets the session target to the first result.
+```json
+execute({
+  "operation": "generate_variations",
+  "arguments": {
+    "prompt": "a mountain at sunrise",
+    "styles": ["golden hour", "foggy morning", "harsh midday sun"]
+  }
+})
+```
+
+### `undo_last_edit`
+Step back one edit in the sidecar chain and set it as the session target. One step at a time; use `revert_to_original` to jump straight to the root.
+```json
+execute({"operation": "undo_last_edit", "arguments": {}})
+```
+
+### `rename_image`
+Rename a generated image (and its metadata sidecar) within the output directory. Updates the session pointer if needed.
+```json
+execute({
+  "operation": "rename_image",
+  "arguments": {"imagePath": "/path/to/generated-xyz.png", "newName": "hero-banner-v1.png"}
+})
+```
+
 ## ⚙️ Configuration Priority
 
 The MCP server loads your API key in the following priority order:
@@ -378,6 +407,8 @@ In addition to `GEMINI_API_KEY`, the following variables let you override defaul
 | `NANO_BANANA_PROMPT_PREFIX` | `""` | Text prepended to every generate/edit prompt |
 | `NANO_BANANA_PROMPT_SUFFIX` | `""` | Text appended to every generate/edit prompt |
 | `NANO_BANANA_LOG_LEVEL` | `WARN` | Log verbosity: `DEBUG`, `INFO`, `WARN`, `ERROR`, or `SILENT` |
+| `NANO_BANANA_RETRY_ATTEMPTS` | `3` | Number of API retry attempts (1–10) |
+| `NANO_BANANA_RETRY_BASE_DELAY_MS` | `1000` | Base delay between retries in ms (doubles each attempt) |
 
 Example:
 ```json

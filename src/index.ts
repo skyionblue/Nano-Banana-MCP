@@ -148,9 +148,12 @@ interface OperationParam {
   items?: { type: string };
 }
 
+type OperationCategory = "generation" | "editing" | "analysis" | "session" | "files" | "config";
+
 interface OperationDef {
   description: string;
   tags: string[];
+  category: OperationCategory;
   params: Record<string, OperationParam>;
   handler: (args: Record<string, unknown>) => Promise<CallToolResult>;
 }
@@ -176,6 +179,8 @@ export const ConfigSchema = z.object({
   timeoutMs: z.number().positive().optional().default(CONSTANTS.TIMEOUT_MS),
   promptPrefix: z.string().optional().default(""),
   promptSuffix: z.string().optional().default(""),
+  retryAttempts: z.number().min(1).max(10).optional().default(CONSTANTS.RETRY_ATTEMPTS),
+  retryBaseDelayMs: z.number().positive().optional().default(CONSTANTS.RETRY_BASE_DELAY_MS),
 });
 
 export type Config = z.infer<typeof ConfigSchema>;
@@ -192,7 +197,7 @@ export class NanoBananaMCP {
 
   constructor() {
     this.server = new Server(
-      { name: "nano-banana-mcp", version: "1.5.0" },
+      { name: "nano-banana-mcp", version: "1.6.0" },
       { capabilities: { tools: {} } }
     );
 
@@ -200,6 +205,7 @@ export class NanoBananaMCP {
       configure_gemini_token: {
         description: "Configure your Gemini API key for nano-banana image generation.",
         tags: ["config", "setup", "api", "key", "token"],
+        category: "config" as const,
         params: {
           apiKey: { type: "string", description: "Your Gemini API key from Google AI Studio", required: true },
         },
@@ -208,6 +214,7 @@ export class NanoBananaMCP {
       generate_image: {
         description: "Generate a NEW image from scratch using a text prompt. Use this only when creating a completely new image.",
         tags: ["generate", "create", "image", "new", "text-to-image"],
+        category: "generation" as const,
         params: {
           prompt: { type: "string", description: "Text prompt describing the image to create", required: true },
         },
@@ -216,6 +223,7 @@ export class NanoBananaMCP {
       edit_image: {
         description: "Edit a specific existing image file using a text prompt, optionally with reference images for style or content guidance.",
         tags: ["edit", "modify", "image", "existing", "file", "reference"],
+        category: "editing" as const,
         params: {
           imagePath: { type: "string", description: "Full file path to the image to edit", required: true },
           prompt: { type: "string", description: "Text describing the modifications to make", required: true },
@@ -226,6 +234,7 @@ export class NanoBananaMCP {
       continue_editing: {
         description: "Continue editing the last image generated or edited in this session. No file path needed — automatically uses the most recent image.",
         tags: ["edit", "iterate", "continue", "last", "session"],
+        category: "editing" as const,
         params: {
           prompt: { type: "string", description: "Text describing the modifications to make to the last image", required: true },
           referenceImages: { type: "array", items: { type: "string" }, description: "Optional file paths to reference images", required: false },
@@ -235,6 +244,7 @@ export class NanoBananaMCP {
       delete_image: {
         description: "Delete a generated image (and its metadata sidecar) from the output directory. Clears the session's last-image pointer if the deleted file was the most recent.",
         tags: ["delete", "remove", "image", "cleanup", "files"],
+        category: "files" as const,
         params: {
           imagePath: { type: "string", description: "Full file path to the image to delete (must be inside the output directory)", required: true },
         },
@@ -243,6 +253,7 @@ export class NanoBananaMCP {
       enhance_prompt: {
         description: "Use Gemini to expand and improve a rough prompt into a detailed, high-quality image generation prompt before generating.",
         tags: ["prompt", "enhance", "improve", "text", "ai"],
+        category: "analysis" as const,
         params: {
           prompt: { type: "string", description: "The rough or simple prompt to improve", required: true },
           style: { type: "string", description: "Optional style hint (e.g. 'photorealistic', 'oil painting', 'anime')", required: false },
@@ -252,18 +263,21 @@ export class NanoBananaMCP {
       get_configuration_status: {
         description: "Check whether the Gemini API key is configured and view active settings (model, output directory, format, timeout, log level).",
         tags: ["config", "status", "check", "settings"],
+        category: "config" as const,
         params: {},
         handler: () => this.opGetConfigurationStatus(),
       },
       get_last_image_info: {
         description: "Get the file path, size, and modification time of the last generated or edited image in this session.",
         tags: ["info", "last", "image", "metadata", "session"],
+        category: "session" as const,
         params: {},
         handler: () => this.opGetLastImageInfo(),
       },
       list_generated_images: {
         description: "List images previously generated or edited by nano-banana in the output directory, sorted newest first, with the prompt that created each one. Optionally filter by operation type or date.",
         tags: ["list", "browse", "images", "history", "files", "filter"],
+        category: "files" as const,
         params: {
           limit: { type: "number", description: "Maximum number of images to return (default: 20)", required: false },
           operation: { type: "string", description: 'Filter to only \"generate\" or \"edit\" images', required: false },
@@ -274,6 +288,7 @@ export class NanoBananaMCP {
       generate_image_batch: {
         description: `Generate multiple variations of the same prompt in parallel and save all of them. Capped at ${CONSTANTS.BATCH_MAX_COUNT} images per call to avoid runaway costs. Sets the session's last image to the first successful result.`,
         tags: ["generate", "batch", "multiple", "variations", "parallel"],
+        category: "generation" as const,
         params: {
           prompt: { type: "string", description: "Text prompt describing the images to create", required: true },
           count: { type: "number", description: `Number of images to generate (default: 2, max: ${CONSTANTS.BATCH_MAX_COUNT})`, required: false },
@@ -284,6 +299,7 @@ export class NanoBananaMCP {
       get_image_history: {
         description: "Show the full edit lineage of an image by walking its sidecar chain. Returns each ancestor in order from the original generation through every edit that produced the current file.",
         tags: ["history", "chain", "edit", "lineage", "sidecar", "trace"],
+        category: "analysis" as const,
         params: {
           imagePath: { type: "string", description: "Full file path to the image whose history you want to trace", required: true },
         },
@@ -292,12 +308,14 @@ export class NanoBananaMCP {
       clear_session: {
         description: "Reset the session's last-image pointer so continue_editing has no target. Does not delete any files.",
         tags: ["session", "clear", "reset", "continue_editing"],
+        category: "session" as const,
         params: {},
         handler: () => this.opClearSession(),
       },
       revert_to_original: {
         description: "Walk the sidecar chain of an image (or the current session target) to find the original generated image and set it as the new session target. Useful for starting a fresh edit chain from the root.",
         tags: ["revert", "original", "session", "chain", "undo"],
+        category: "session" as const,
         params: {
           imagePath: { type: "string", description: "Full file path to any image in the chain. Defaults to the current session target if omitted.", required: false },
         },
@@ -306,6 +324,7 @@ export class NanoBananaMCP {
       export_images: {
         description: "Copy a selection of generated images (and their metadata sidecars) into a new directory. Useful for collecting the best results from a session into one place.",
         tags: ["export", "copy", "save", "collect", "files"],
+        category: "files" as const,
         params: {
           outputDir: { type: "string", description: "Directory to copy images into (will be created if it does not exist)", required: true },
           imagePaths: { type: "array", items: { type: "string" }, description: "Specific image file paths to export. Omit to export all images in the output directory.", required: false },
@@ -315,6 +334,7 @@ export class NanoBananaMCP {
       compare_images: {
         description: "Use Gemini to produce a detailed visual comparison of two images — similarities, differences, and a recommendation. Uses the text model, so it is fast and cheap.",
         tags: ["compare", "diff", "analyze", "visual", "gemini", "text"],
+        category: "analysis" as const,
         params: {
           imagePathA: { type: "string", description: "Full file path to the first image", required: true },
           imagePathB: { type: "string", description: "Full file path to the second image", required: true },
@@ -325,6 +345,7 @@ export class NanoBananaMCP {
       rate_images: {
         description: "Use Gemini to rank a list of images from best to worst against a criterion. Returns a ranked list with reasoning. Optionally sets the top-ranked image as the session target.",
         tags: ["rate", "rank", "score", "compare", "analyze", "gemini", "batch"],
+        category: "analysis" as const,
         params: {
           imagePaths: { type: "array", items: { type: "string" }, description: "File paths of the images to rank (2–10)", required: true },
           criterion: { type: "string", description: "What to rank by, e.g. \"most photorealistic\", \"best composition\", \"most suitable for a homepage hero\". Defaults to overall quality.", required: false },
@@ -335,6 +356,7 @@ export class NanoBananaMCP {
       cleanup_old_images: {
         description: "Delete images (and their sidecars) from the output directory that are older than a given number of days. Defaults to dry-run mode — set dryRun: false to actually delete.",
         tags: ["cleanup", "delete", "old", "housekeeping", "maintenance", "files"],
+        category: "files" as const,
         params: {
           olderThanDays: { type: "number", description: "Delete images last modified more than this many days ago", required: true },
           dryRun: { type: "boolean", description: "If true (default), only list what would be deleted without actually deleting anything", required: false },
@@ -344,8 +366,39 @@ export class NanoBananaMCP {
       get_session_summary: {
         description: "Return a compact summary of the current session: active config, session target, total image count and disk usage in the output directory.",
         tags: ["session", "summary", "status", "stats", "info"],
+        category: "session" as const,
         params: {},
         handler: () => this.opGetSessionSummary(),
+      },
+      generate_variations: {
+        description: "Generate distinct style variations of the same prompt in parallel. Each variation appends a different style suffix to the prompt. Defaults to warm/cool/high-contrast if no styles provided. Capped at 5.",
+        tags: ["generate", "variations", "styles", "batch", "creative"],
+        category: "generation" as const,
+        params: {
+          prompt: { type: "string", description: "Base prompt to vary", required: true },
+          styles: { type: "array", items: { type: "string" }, description: "Style suffixes to append (e.g. [\"warm tones\", \"cool tones\"]). Defaults to [\"warm tones\", \"cool tones\", \"high contrast\"].", required: false },
+          count: { type: "number", description: `Max variations to generate (default: number of styles, max: ${CONSTANTS.BATCH_MAX_COUNT})`, required: false },
+        },
+        handler: (args) => this.opGenerateVariations(args as { prompt: string; styles?: string[]; count?: number }),
+      },
+      undo_last_edit: {
+        description: "Step back one edit in the sidecar chain — sets the session target to the image's sourceImage. One step at a time; use revert_to_original to jump straight to the root.",
+        tags: ["undo", "back", "edit", "step", "session", "previous"],
+        category: "editing" as const,
+        params: {
+          imagePath: { type: "string", description: "Image to step back from. Defaults to the current session target if omitted.", required: false },
+        },
+        handler: (args) => this.opUndoLastEdit(args as { imagePath?: string }),
+      },
+      rename_image: {
+        description: "Rename a generated image (and its metadata sidecar) within the output directory. Updates the session pointer if the renamed file was the current target.",
+        tags: ["rename", "move", "name", "files", "organize"],
+        category: "files" as const,
+        params: {
+          imagePath: { type: "string", description: "Full file path to the image to rename (must be inside the output directory)", required: true },
+          newName: { type: "string", description: "New filename including extension (e.g. \"hero-banner-v2.png\"). No directory separators.", required: true },
+        },
+        handler: (args) => this.opRenameImage(args as { imagePath: string; newName: string }),
       },
     };
 
@@ -359,13 +412,18 @@ export class NanoBananaMCP {
       tools: [
         {
           name: "search",
-          description: "Discover available nano-banana operations. Returns each operation's name, description, and parameter list. Use this before execute to find the right operation and understand its required arguments. Optionally filter by keyword or set verbose:true for full parameter descriptions.",
+          description: "Discover available nano-banana operations. Returns each operation's name, description, and parameter list. Filter by keyword, category, or both. Use verbose:true for full parameter descriptions.",
           inputSchema: {
             type: "object",
             properties: {
               query: {
                 type: "string",
-                description: "Optional keyword to filter operations (e.g. 'generate', 'edit', 'config', 'list'). Omit to return all operations.",
+                description: "Optional keyword to filter operations (e.g. 'generate', 'edit', 'rename'). Omit to return all operations.",
+              },
+              category: {
+                type: "string",
+                enum: ["generation", "editing", "analysis", "session", "files", "config"],
+                description: "Optional category filter. 'generation'=image creation, 'editing'=modifying existing images, 'analysis'=Gemini text analysis, 'session'=session management, 'files'=file operations, 'config'=configuration.",
               },
               verbose: {
                 type: "boolean",
@@ -418,10 +476,15 @@ export class NanoBananaMCP {
   // --- search handler ---
 
   private handleSearch(request: CallToolRequest): CallToolResult {
-    const { query, verbose = false } = (request.params.arguments ?? {}) as { query?: string; verbose?: boolean };
+    const { query, verbose = false, category } = (request.params.arguments ?? {}) as {
+      query?: string;
+      verbose?: boolean;
+      category?: OperationCategory;
+    };
     const term = query?.toLowerCase().trim();
 
     const matches = Object.entries(this.operations).filter(([name, op]) => {
+      if (category && op.category !== category) return false;
       if (!term) return true;
       return (
         name.includes(term) ||
@@ -431,16 +494,18 @@ export class NanoBananaMCP {
     });
 
     if (matches.length === 0) {
+      const filterDesc = [query ? `"${query}"` : "", category ? `category="${category}"` : ""].filter(Boolean).join(", ");
       return {
         content: [{
           type: "text",
-          text: `No operations matched "${query}". Try search without a query to see all available operations.`,
+          text: `No operations matched ${filterDesc}. Try search without filters to see all operations.`,
         }],
       };
     }
 
+    const filterDesc = [term ? `"${query}"` : "", category ? `category=${category}` : ""].filter(Boolean).join(", ");
     const lines: string[] = [
-      `nano-banana operations${term ? ` matching "${query}"` : ""} (${matches.length}):`,
+      `nano-banana operations${filterDesc ? ` matching ${filterDesc}` : ""} (${matches.length}):`,
       "",
     ];
 
@@ -520,9 +585,11 @@ export class NanoBananaMCP {
   private async withRetry<T>(
     fn: () => Promise<T>,
     label: string,
-    attempts: number = CONSTANTS.RETRY_ATTEMPTS,
-    baseDelayMs: number = CONSTANTS.RETRY_BASE_DELAY_MS
+    attemptsOverride?: number,
+    baseDelayMsOverride?: number
   ): Promise<T> {
+    const attempts = attemptsOverride ?? this.config?.retryAttempts ?? CONSTANTS.RETRY_ATTEMPTS;
+    const baseDelayMs = baseDelayMsOverride ?? this.config?.retryBaseDelayMs ?? CONSTANTS.RETRY_BASE_DELAY_MS;
     let lastError: unknown;
     for (let attempt = 1; attempt <= attempts; attempt++) {
       try {
@@ -700,6 +767,8 @@ export class NanoBananaMCP {
     const envTimeoutMs = process.env.NANO_BANANA_TIMEOUT_MS;
     const envPromptPrefix = process.env.NANO_BANANA_PROMPT_PREFIX;
     const envPromptSuffix = process.env.NANO_BANANA_PROMPT_SUFFIX;
+    const envRetryAttempts = process.env.NANO_BANANA_RETRY_ATTEMPTS;
+    const envRetryBaseDelayMs = process.env.NANO_BANANA_RETRY_BASE_DELAY_MS;
 
     const buildOverrides = (): Partial<Record<string, unknown>> => {
       const o: Partial<Record<string, unknown>> = {};
@@ -709,6 +778,8 @@ export class NanoBananaMCP {
       if (envTimeoutMs) o.timeoutMs = Number(envTimeoutMs);
       if (envPromptPrefix !== undefined) o.promptPrefix = envPromptPrefix;
       if (envPromptSuffix !== undefined) o.promptSuffix = envPromptSuffix;
+      if (envRetryAttempts) o.retryAttempts = Number(envRetryAttempts);
+      if (envRetryBaseDelayMs) o.retryBaseDelayMs = Number(envRetryBaseDelayMs);
       return o;
     };
 
@@ -1698,8 +1769,173 @@ export class NanoBananaMCP {
     return { content: [{ type: "text", text: lines.join("\n") }] };
   }
 
+  private async opGenerateVariations(args: { prompt: string; styles?: string[]; count?: number }): Promise<CallToolResult> {
+    this.ensureConfigured();
+    const defaultStyles = ["warm tones", "cool tones", "high contrast"];
+    const styles = args.styles && args.styles.length > 0 ? args.styles : defaultStyles;
+    const count = Math.min(args.count ?? styles.length, CONSTANTS.BATCH_MAX_COUNT);
+    const selected = styles.slice(0, count);
+
+    log.info("generate_variations starting", { count, model: this.config!.model });
+
+    const results = await Promise.allSettled(
+      selected.map(style => this.generateImageCore(`${args.prompt}, ${style}`))
+    );
+
+    type CoreResult = { savedPaths: string[]; imageContent: McpImageContent[]; textContent: string; tokenUsage?: { total: number; prompt: number; response: number } };
+    const successes: Array<{ style: string; core: CoreResult }> = [];
+    const failures: Array<{ style: string; message: string }> = [];
+
+    results.forEach((r, i) => {
+      if (r.status === "fulfilled") {
+        successes.push({ style: selected[i], core: r.value });
+      } else {
+        failures.push({ style: selected[i], message: classifyApiError(r.reason, "generate_variations").message });
+      }
+    });
+
+    if (successes.length === 0) {
+      throw new McpError(ErrorCode.InternalError, `All ${count} variations failed. First error: ${failures[0].message}`);
+    }
+
+    const firstSavedPath = successes.find(s => s.core.savedPaths.length > 0)?.core.savedPaths[0] ?? null;
+    if (firstSavedPath) {
+      this.lastImagePath = firstSavedPath;
+      await this.saveSession();
+    }
+
+    const totalTokens = successes.reduce((s, r) => s + (r.core.tokenUsage?.total ?? 0), 0);
+    const promptTokens = successes.reduce((s, r) => s + (r.core.tokenUsage?.prompt ?? 0), 0);
+    const responseTokens = successes.reduce((s, r) => s + (r.core.tokenUsage?.response ?? 0), 0);
+    const tokenUsage = totalTokens > 0 ? { total: totalTokens, prompt: promptTokens, response: responseTokens } : undefined;
+
+    const lines: string[] = [
+      `Generated ${successes.length}/${count} variation(s) of: "${args.prompt}"\n`,
+    ];
+
+    successes.forEach(({ style, core }) => {
+      lines.push(`  Style: "${style}"`);
+      core.savedPaths.forEach(p => lines.push(`  📁 ${p}`));
+      lines.push("");
+    });
+
+    if (failures.length > 0) {
+      lines.push(`⚠️  Failed variations:\n${failures.map(f => `- "${f.style}": ${f.message}`).join("\n")}\n`);
+    }
+
+    if (firstSavedPath) {
+      lines.push(`💡 First variation set as session target — use continue_editing to iterate.`);
+    }
+
+    if (tokenUsage) {
+      const inputCost = (tokenUsage.prompt / 1_000_000) * CONSTANTS.PRICING_INPUT_PER_M;
+      const outputCost = (tokenUsage.response / 1_000_000) * CONSTANTS.PRICING_OUTPUT_PER_M;
+      const totalCost = inputCost + outputCost;
+      lines.push(`\n📊 Total tokens: ${tokenUsage.total.toLocaleString()} — est. ${totalCost < 0.001 ? "<$0.001" : `~$${totalCost.toFixed(3)}`}`);
+    }
+
+    const content: McpContent[] = [
+      { type: "text", text: lines.join("\n") },
+      ...successes.flatMap(s => s.core.imageContent),
+    ];
+    return { content };
+  }
+
+  private async opUndoLastEdit(args: { imagePath?: string }): Promise<CallToolResult> {
+    const targetPath = args.imagePath ? path.resolve(args.imagePath) : this.lastImagePath;
+    if (!targetPath) {
+      throw new McpError(ErrorCode.InvalidRequest,
+        "No session target set and no imagePath provided. Generate or edit an image first.");
+    }
+
+    const sidecar = await this.readImageSidecar(targetPath);
+    if (!sidecar?.sourceImage) {
+      return {
+        content: [{
+          type: "text",
+          text: `"${targetPath}" is the original — it has no previous step to undo to.\n\nUse generate_image to start a new image.`,
+        }],
+      };
+    }
+
+    const prevPath = path.resolve(sidecar.sourceImage);
+    try { await fs.access(prevPath); } catch {
+      throw new McpError(ErrorCode.InvalidRequest,
+        `Previous image not found at: ${prevPath} — it may have been deleted.`);
+    }
+
+    this.lastImagePath = prevPath;
+    await this.saveSession();
+
+    const prevSidecar = await this.readImageSidecar(prevPath);
+    const promptNote = prevSidecar?.prompt ? `\n  Prompt: "${prevSidecar.prompt}"` : "";
+
+    return {
+      content: [{
+        type: "text",
+        text: `Undone — session target is now:\n  ${prevPath}${promptNote}\n\nUse continue_editing to make a different edit, or undo_last_edit again to go further back.`,
+      }],
+    };
+  }
+
+  private async opRenameImage(args: { imagePath: string; newName: string }): Promise<CallToolResult> {
+    const imagesDir = this.getImagesDirectory();
+    const resolved = path.resolve(args.imagePath);
+
+    if (!resolved.startsWith(imagesDir)) {
+      throw new McpError(ErrorCode.InvalidParams,
+        `Can only rename images inside the output directory: ${imagesDir}`);
+    }
+
+    if (args.newName.includes(path.sep) || args.newName.includes("/") || args.newName.includes("\\")) {
+      throw new McpError(ErrorCode.InvalidParams, "newName must be a filename only — no directory separators.");
+    }
+
+    if (!/\.(png|jpe?g|webp)$/i.test(args.newName)) {
+      throw new McpError(ErrorCode.InvalidParams, "newName must end with .png, .jpg, .jpeg, or .webp.");
+    }
+
+    try { await fs.access(resolved); } catch {
+      throw new McpError(ErrorCode.InvalidParams, `File not found: ${args.imagePath}`);
+    }
+
+    const newPath = path.join(imagesDir, args.newName);
+
+    // Avoid overwriting an existing file
+    if (newPath !== resolved) {
+      try {
+        await fs.access(newPath);
+        throw new McpError(ErrorCode.InvalidParams,
+          `A file named "${args.newName}" already exists in the output directory.`);
+      } catch (err) {
+        if (err instanceof McpError) throw err;
+      }
+    }
+
+    await fs.rename(resolved, newPath);
+    log.info("Image renamed", { from: resolved, to: newPath });
+
+    try {
+      await fs.rename(this.sidecarPath(resolved), this.sidecarPath(newPath));
+    } catch { /* no sidecar is fine */ }
+
+    let sessionNote = "";
+    if (this.lastImagePath === resolved) {
+      this.lastImagePath = newPath;
+      await this.saveSession();
+      sessionNote = "\n\nSession target updated to new path.";
+    }
+
+    return {
+      content: [{
+        type: "text",
+        text: `Renamed:\n  ${resolved}\n  → ${newPath}${sessionNote}`,
+      }],
+    };
+  }
+
   public async run(): Promise<void> {
-    log.info("nano-banana-mcp v1.5.0 starting", { logLevel: log.levelName });
+    log.info("nano-banana-mcp v1.6.0 starting", { logLevel: log.levelName });
     await this.loadConfig();
     await this.loadSession();
     const transport = new StdioServerTransport();

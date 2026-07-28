@@ -2376,3 +2376,365 @@ describe("NanoBananaMCP get_session_summary", () => {
     expect(result.content[0].text).toContain("0 file(s)");
   });
 });
+
+// -------------------------------------------------------------------
+// search — category filter
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP search category filter", () => {
+  let server: NanoBananaMCP;
+
+  beforeEach(() => { server = new NanoBananaMCP(); });
+
+  it("returns only generation ops for category='generation'", () => {
+    const result = callSearch(server, { category: "generation" });
+    const text = result.content[0].text as string;
+    expect(text).toContain("generate_image");
+    expect(text).toContain("generate_image_batch");
+    expect(text).toContain("generate_variations");
+    expect(text).not.toContain("edit_image");
+    expect(text).not.toContain("compare_images");
+  });
+
+  it("returns only editing ops for category='editing'", () => {
+    const result = callSearch(server, { category: "editing" });
+    const text = result.content[0].text as string;
+    expect(text).toContain("edit_image");
+    expect(text).toContain("continue_editing");
+    expect(text).toContain("undo_last_edit");
+    expect(text).not.toContain("generate_image");
+  });
+
+  it("returns only analysis ops for category='analysis'", () => {
+    const result = callSearch(server, { category: "analysis" });
+    const text = result.content[0].text as string;
+    expect(text).toContain("compare_images");
+    expect(text).toContain("rate_images");
+    expect(text).toContain("enhance_prompt");
+    expect(text).not.toContain("generate_image");
+  });
+
+  it("returns only session ops for category='session'", () => {
+    const result = callSearch(server, { category: "session" });
+    const text = result.content[0].text as string;
+    expect(text).toContain("clear_session");
+    expect(text).toContain("revert_to_original");
+    expect(text).toContain("get_session_summary");
+    expect(text).not.toContain("generate_image");
+  });
+
+  it("returns only file ops for category='files'", () => {
+    const result = callSearch(server, { category: "files" });
+    const text = result.content[0].text as string;
+    expect(text).toContain("list_generated_images");
+    expect(text).toContain("delete_image");
+    expect(text).toContain("rename_image");
+    expect(text).toContain("export_images");
+    expect(text).not.toContain("generate_image");
+  });
+
+  it("combines category and query filters", () => {
+    const result = callSearch(server, { category: "generation", query: "batch" });
+    const text = result.content[0].text as string;
+    expect(text).toContain("generate_image_batch");
+    expect(text).not.toContain("generate_image\n");
+    expect(text).not.toContain("rate_images");
+  });
+
+  it("returns no-match message when category+query combination matches nothing", () => {
+    const result = callSearch(server, { category: "config", query: "nonexistent" });
+    expect(result.content[0].text).toContain("No operations matched");
+  });
+});
+
+// -------------------------------------------------------------------
+// ConfigSchema — retry fields
+// -------------------------------------------------------------------
+
+describe("ConfigSchema retry fields", () => {
+  it("defaults retryAttempts to CONSTANTS.RETRY_ATTEMPTS", () => {
+    const c = ConfigSchema.parse({ geminiApiKey: "AIza" + "A".repeat(35) });
+    expect(c.retryAttempts).toBe(CONSTANTS.RETRY_ATTEMPTS);
+  });
+
+  it("defaults retryBaseDelayMs to CONSTANTS.RETRY_BASE_DELAY_MS", () => {
+    const c = ConfigSchema.parse({ geminiApiKey: "AIza" + "A".repeat(35) });
+    expect(c.retryBaseDelayMs).toBe(CONSTANTS.RETRY_BASE_DELAY_MS);
+  });
+
+  it("accepts custom retryAttempts within bounds", () => {
+    const c = ConfigSchema.parse({ geminiApiKey: "k", retryAttempts: 5 });
+    expect(c.retryAttempts).toBe(5);
+  });
+
+  it("rejects retryAttempts of 0", () => {
+    expect(() => ConfigSchema.parse({ geminiApiKey: "k", retryAttempts: 0 })).toThrow();
+  });
+
+  it("rejects retryAttempts above 10", () => {
+    expect(() => ConfigSchema.parse({ geminiApiKey: "k", retryAttempts: 11 })).toThrow();
+  });
+
+  it("accepts custom retryBaseDelayMs", () => {
+    const c = ConfigSchema.parse({ geminiApiKey: "k", retryBaseDelayMs: 500 });
+    expect(c.retryBaseDelayMs).toBe(500);
+  });
+});
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — generate_variations
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP generate_variations", () => {
+  let server: NanoBananaMCP;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+    configureServer(server);
+    stubFsDefaults();
+  });
+
+  it("throws when not configured", async () => {
+    const unconfigured = new NanoBananaMCP();
+    await expect(callExecute(unconfigured, "generate_variations", { prompt: "sunset" }))
+      .rejects.toMatchObject({ code: ErrorCode.InvalidRequest });
+  });
+
+  it("uses default styles when none provided", async () => {
+    const coreSpy = vi.spyOn(server as any, "generateImageCore").mockResolvedValue({
+      savedPaths: [path.join(os.homedir(), "img.png")], imageContent: [], textContent: "", tokenUsage: undefined,
+    });
+    await callExecute(server, "generate_variations", { prompt: "a mountain" });
+    expect(coreSpy).toHaveBeenCalledTimes(3);
+    expect(coreSpy).toHaveBeenCalledWith("a mountain, warm tones");
+    expect(coreSpy).toHaveBeenCalledWith("a mountain, cool tones");
+    expect(coreSpy).toHaveBeenCalledWith("a mountain, high contrast");
+  });
+
+  it("uses provided styles", async () => {
+    const coreSpy = vi.spyOn(server as any, "generateImageCore").mockResolvedValue({
+      savedPaths: [path.join(os.homedir(), "img.png")], imageContent: [], textContent: "", tokenUsage: undefined,
+    });
+    await callExecute(server, "generate_variations", { prompt: "city", styles: ["noir", "vivid"] });
+    expect(coreSpy).toHaveBeenCalledWith("city, noir");
+    expect(coreSpy).toHaveBeenCalledWith("city, vivid");
+  });
+
+  it("caps at BATCH_MAX_COUNT even with more styles", async () => {
+    const coreSpy = vi.spyOn(server as any, "generateImageCore").mockResolvedValue({
+      savedPaths: [], imageContent: [], textContent: "", tokenUsage: undefined,
+    });
+    const manyStyles = Array.from({ length: 10 }, (_, i) => `style${i}`);
+    await callExecute(server, "generate_variations", { prompt: "test", styles: manyStyles });
+    expect(coreSpy).toHaveBeenCalledTimes(CONSTANTS.BATCH_MAX_COUNT);
+  });
+
+  it("labels each variation by style in the response", async () => {
+    vi.spyOn(server as any, "generateImageCore").mockResolvedValue({
+      savedPaths: [path.join(os.homedir(), "img.png")], imageContent: [], textContent: "", tokenUsage: undefined,
+    });
+    const result = await callExecute(server, "generate_variations", { prompt: "waves", styles: ["sunset", "dawn"] });
+    const text = result.content[0].text as string;
+    expect(text).toContain('"sunset"');
+    expect(text).toContain('"dawn"');
+  });
+
+  it("sets lastImagePath to first successful variation", async () => {
+    const firstPath = path.join(os.homedir(), "first.png");
+    let callCount = 0;
+    vi.spyOn(server as any, "generateImageCore").mockImplementation(async () => {
+      callCount++;
+      return { savedPaths: [path.join(os.homedir(), `img${callCount}.png`)], imageContent: [], textContent: "", tokenUsage: undefined };
+    });
+    await callExecute(server, "generate_variations", { prompt: "test", styles: ["a", "b"] });
+    expect((server as any).lastImagePath).toMatch(/img1\.png$/);
+  });
+
+  it("throws when ALL variations fail", async () => {
+    vi.spyOn(server as any, "generateImageCore").mockRejectedValue(new Error("API error"));
+    await expect(callExecute(server, "generate_variations", { prompt: "test" }))
+      .rejects.toMatchObject({ code: ErrorCode.InternalError });
+  });
+
+  it("reports partial failures without throwing", async () => {
+    let call = 0;
+    vi.spyOn(server as any, "generateImageCore").mockImplementation(async () => {
+      call++;
+      if (call === 2) throw new Error("503 unavailable");
+      return { savedPaths: [path.join(os.homedir(), `img${call}.png`)], imageContent: [], textContent: "", tokenUsage: undefined };
+    });
+    const result = await callExecute(server, "generate_variations", { prompt: "test", styles: ["a", "b", "c"] });
+    expect(result.content[0].text).toContain("2/3");
+    expect(result.content[0].text).toContain("⚠️");
+  });
+});
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — undo_last_edit
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP undo_last_edit", () => {
+  let server: NanoBananaMCP;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+    configureServer(server);
+    stubFsDefaults();
+  });
+
+  it("throws when no session target and no imagePath provided", async () => {
+    await expect(callExecute(server, "undo_last_edit", {}))
+      .rejects.toMatchObject({ code: ErrorCode.InvalidRequest });
+  });
+
+  it("returns 'already original' message when sidecar has no sourceImage", async () => {
+    const imgPath = path.join(os.homedir(), "original.png");
+    (server as any).lastImagePath = imgPath;
+    vi.mocked(fs.readFile).mockResolvedValue(
+      JSON.stringify({ operation: "generate", prompt: "p", model: "m", timestamp: "t" })
+    );
+    const result = await callExecute(server, "undo_last_edit", {});
+    expect(result.content[0].text).toContain("original");
+    expect(result.content[0].text).toContain("no previous step");
+  });
+
+  it("sets lastImagePath to sourceImage and saves session", async () => {
+    const editPath = path.join(os.homedir(), "edit.png");
+    const origPath = path.join(os.homedir(), "orig.png");
+    (server as any).lastImagePath = editPath;
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+    vi.mocked(fs.readFile).mockImplementation(async (p: any) => {
+      if (String(p).endsWith("edit.json")) return JSON.stringify({ operation: "edit", prompt: "e", model: "m", timestamp: "t", sourceImage: origPath });
+      if (String(p).endsWith("orig.json")) return JSON.stringify({ operation: "generate", prompt: "orig", model: "m", timestamp: "t" });
+      throw new Error("ENOENT");
+    });
+    const result = await callExecute(server, "undo_last_edit", {});
+    expect((server as any).lastImagePath).toBe(path.resolve(origPath));
+    expect(result.content[0].text).toContain(path.resolve(origPath));
+    const sessionCall = vi.mocked(fs.writeFile).mock.calls.find(([p]) =>
+      String(p).endsWith(".nano-banana-session.json")
+    );
+    expect(sessionCall).toBeDefined();
+  });
+
+  it("uses the provided imagePath instead of session target", async () => {
+    const editPath = path.join(os.homedir(), "edit.png");
+    const origPath = path.join(os.homedir(), "orig.png");
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+    vi.mocked(fs.readFile).mockImplementation(async (p: any) => {
+      if (String(p).endsWith("edit.json")) return JSON.stringify({ operation: "edit", prompt: "e", model: "m", timestamp: "t", sourceImage: origPath });
+      if (String(p).endsWith("orig.json")) return JSON.stringify({ operation: "generate", prompt: "orig", model: "m", timestamp: "t" });
+      throw new Error("ENOENT");
+    });
+    await callExecute(server, "undo_last_edit", { imagePath: editPath });
+    expect((server as any).lastImagePath).toBe(path.resolve(origPath));
+  });
+
+  it("throws when previous image file is missing", async () => {
+    const editPath = path.join(os.homedir(), "edit.png");
+    const origPath = path.join(os.homedir(), "orig.png");
+    (server as any).lastImagePath = editPath;
+    vi.mocked(fs.access).mockRejectedValue(new Error("ENOENT"));
+    vi.mocked(fs.readFile).mockImplementation(async (p: any) => {
+      if (String(p).endsWith("edit.json")) return JSON.stringify({ operation: "edit", prompt: "e", model: "m", timestamp: "t", sourceImage: origPath });
+      throw new Error("ENOENT");
+    });
+    await expect(callExecute(server, "undo_last_edit", {}))
+      .rejects.toMatchObject({ code: ErrorCode.InvalidRequest });
+  });
+
+  it("shows previous image prompt in response when sidecar exists", async () => {
+    const editPath = path.join(os.homedir(), "edit.png");
+    const origPath = path.join(os.homedir(), "orig.png");
+    (server as any).lastImagePath = editPath;
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+    vi.mocked(fs.readFile).mockImplementation(async (p: any) => {
+      if (String(p).endsWith("edit.json")) return JSON.stringify({ operation: "edit", prompt: "e", model: "m", timestamp: "t", sourceImage: origPath });
+      if (String(p).endsWith("orig.json")) return JSON.stringify({ operation: "generate", prompt: "a sunset", model: "m", timestamp: "t" });
+      throw new Error("ENOENT");
+    });
+    const result = await callExecute(server, "undo_last_edit", {});
+    expect(result.content[0].text).toContain("a sunset");
+  });
+});
+
+// -------------------------------------------------------------------
+// NanoBananaMCP — rename_image
+// -------------------------------------------------------------------
+
+describe("NanoBananaMCP rename_image", () => {
+  let server: NanoBananaMCP;
+  let imagesDir: string;
+
+  beforeEach(() => {
+    server = new NanoBananaMCP();
+    configureServer(server);
+    stubFsDefaults();
+    imagesDir = (server as any).getImagesDirectory();
+    vi.mocked(fs.rename).mockResolvedValue(undefined as any);
+  });
+
+  it("throws when image is outside the output directory", async () => {
+    await expect(callExecute(server, "rename_image", { imagePath: "/etc/img.png", newName: "new.png" }))
+      .rejects.toMatchObject({ code: ErrorCode.InvalidParams });
+  });
+
+  it("throws when newName contains a path separator", async () => {
+    const src = path.join(imagesDir, "src.png");
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+    await expect(callExecute(server, "rename_image", { imagePath: src, newName: "subdir/new.png" }))
+      .rejects.toMatchObject({ code: ErrorCode.InvalidParams });
+  });
+
+  it("throws when newName has no image extension", async () => {
+    const src = path.join(imagesDir, "src.png");
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+    await expect(callExecute(server, "rename_image", { imagePath: src, newName: "new.txt" }))
+      .rejects.toMatchObject({ code: ErrorCode.InvalidParams });
+  });
+
+  it("throws when source file does not exist", async () => {
+    const src = path.join(imagesDir, "missing.png");
+    vi.mocked(fs.access).mockRejectedValue(new Error("ENOENT"));
+    await expect(callExecute(server, "rename_image", { imagePath: src, newName: "new.png" }))
+      .rejects.toMatchObject({ code: ErrorCode.InvalidParams });
+  });
+
+  it("throws when destination name already exists", async () => {
+    const src = path.join(imagesDir, "src.png");
+    const dest = path.join(imagesDir, "existing.png");
+    vi.mocked(fs.access).mockResolvedValue(undefined as any);
+    await expect(callExecute(server, "rename_image", { imagePath: src, newName: "existing.png" }))
+      .rejects.toMatchObject({ code: ErrorCode.InvalidParams });
+  });
+
+  it("renames the image file successfully", async () => {
+    const src = path.join(imagesDir, "old.png");
+    vi.mocked(fs.access).mockImplementation(async (p: any) => {
+      if (String(p) === path.join(imagesDir, "new.png")) throw new Error("ENOENT");
+    });
+    await callExecute(server, "rename_image", { imagePath: src, newName: "new.png" });
+    expect(fs.rename).toHaveBeenCalledWith(path.resolve(src), path.join(imagesDir, "new.png"));
+  });
+
+  it("updates session pointer when renamed file was the target", async () => {
+    const src = path.join(imagesDir, "old.png");
+    (server as any).lastImagePath = path.resolve(src);
+    vi.mocked(fs.access).mockImplementation(async (p: any) => {
+      if (String(p) === path.join(imagesDir, "renamed.png")) throw new Error("ENOENT");
+    });
+    const result = await callExecute(server, "rename_image", { imagePath: src, newName: "renamed.png" });
+    expect((server as any).lastImagePath).toBe(path.join(imagesDir, "renamed.png"));
+    expect(result.content[0].text).toContain("Session target updated");
+  });
+
+  it("returns confirmation with old and new paths", async () => {
+    const src = path.join(imagesDir, "old.png");
+    vi.mocked(fs.access).mockImplementation(async (p: any) => {
+      if (String(p) === path.join(imagesDir, "new.png")) throw new Error("ENOENT");
+    });
+    const result = await callExecute(server, "rename_image", { imagePath: src, newName: "new.png" });
+    expect(result.content[0].text).toContain("old.png");
+    expect(result.content[0].text).toContain("new.png");
+  });
+});
