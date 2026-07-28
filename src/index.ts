@@ -192,7 +192,7 @@ export class NanoBananaMCP {
 
   constructor() {
     this.server = new Server(
-      { name: "nano-banana-mcp", version: "1.3.0" },
+      { name: "nano-banana-mcp", version: "1.4.0" },
       { capabilities: { tools: {} } }
     );
 
@@ -262,12 +262,14 @@ export class NanoBananaMCP {
         handler: () => this.opGetLastImageInfo(),
       },
       list_generated_images: {
-        description: "List images previously generated or edited by nano-banana in the output directory, sorted newest first, with the prompt that created each one.",
-        tags: ["list", "browse", "images", "history", "files"],
+        description: "List images previously generated or edited by nano-banana in the output directory, sorted newest first, with the prompt that created each one. Optionally filter by operation type or date.",
+        tags: ["list", "browse", "images", "history", "files", "filter"],
         params: {
           limit: { type: "number", description: "Maximum number of images to return (default: 20)", required: false },
+          operation: { type: "string", description: 'Filter to only \"generate\" or \"edit\" images', required: false },
+          since: { type: "string", description: "ISO 8601 date string — only return images created on or after this date (e.g. \"2025-01-24\" or \"2025-01-24T12:00:00Z\")", required: false },
         },
-        handler: (args) => this.opListGeneratedImages(args as { limit?: number }),
+        handler: (args) => this.opListGeneratedImages(args as { limit?: number; operation?: "generate" | "edit"; since?: string }),
       },
       generate_image_batch: {
         description: `Generate multiple variations of the same prompt in parallel and save all of them. Capped at ${CONSTANTS.BATCH_MAX_COUNT} images per call to avoid runaway costs. Sets the session's last image to the first successful result.`,
@@ -275,8 +277,9 @@ export class NanoBananaMCP {
         params: {
           prompt: { type: "string", description: "Text prompt describing the images to create", required: true },
           count: { type: "number", description: `Number of images to generate (default: 2, max: ${CONSTANTS.BATCH_MAX_COUNT})`, required: false },
+          referenceImages: { type: "array", items: { type: "string" }, description: "Optional file paths to reference images applied to all variations for style or content guidance", required: false },
         },
-        handler: (args) => this.opGenerateImageBatch(args as { prompt: string; count?: number }),
+        handler: (args) => this.opGenerateImageBatch(args as { prompt: string; count?: number; referenceImages?: string[] }),
       },
       get_image_history: {
         description: "Show the full edit lineage of an image by walking its sidecar chain. Returns each ancestor in order from the original generation through every edit that produced the current file.",
@@ -285,6 +288,29 @@ export class NanoBananaMCP {
           imagePath: { type: "string", description: "Full file path to the image whose history you want to trace", required: true },
         },
         handler: (args) => this.opGetImageHistory(args as { imagePath: string }),
+      },
+      clear_session: {
+        description: "Reset the session's last-image pointer so continue_editing has no target. Does not delete any files.",
+        tags: ["session", "clear", "reset", "continue_editing"],
+        params: {},
+        handler: () => this.opClearSession(),
+      },
+      revert_to_original: {
+        description: "Walk the sidecar chain of an image (or the current session target) to find the original generated image and set it as the new session target. Useful for starting a fresh edit chain from the root.",
+        tags: ["revert", "original", "session", "chain", "undo"],
+        params: {
+          imagePath: { type: "string", description: "Full file path to any image in the chain. Defaults to the current session target if omitted.", required: false },
+        },
+        handler: (args) => this.opRevertToOriginal(args as { imagePath?: string }),
+      },
+      export_images: {
+        description: "Copy a selection of generated images (and their metadata sidecars) into a new directory. Useful for collecting the best results from a session into one place.",
+        tags: ["export", "copy", "save", "collect", "files"],
+        params: {
+          outputDir: { type: "string", description: "Directory to copy images into (will be created if it does not exist)", required: true },
+          imagePaths: { type: "array", items: { type: "string" }, description: "Specific image file paths to export. Omit to export all images in the output directory.", required: false },
+        },
+        handler: (args) => this.opExportImages(args as { outputDir: string; imagePaths?: string[] }),
       },
     };
 
@@ -725,16 +751,34 @@ export class NanoBananaMCP {
 
   // Core image generation — saves file + sidecar, returns paths and image content.
   // Does NOT update lastImagePath or save session (callers do that).
-  private async generateImageCore(originalPrompt: string): Promise<{
+  private async generateImageCore(originalPrompt: string, referenceImages?: string[]): Promise<{
     savedPaths: string[];
     imageContent: McpImageContent[];
     textContent: string;
     tokenUsage?: { total: number; prompt: number; response: number };
   }> {
     const prompt = this.applyPromptAffix(originalPrompt);
+
+    // Build contents: plain string for text-only, multi-part when reference images provided
+    let contents: string | { parts: ContentPart[] } = prompt;
+    if (referenceImages && referenceImages.length > 0) {
+      const parts: ContentPart[] = [];
+      for (const refPath of referenceImages) {
+        try {
+          this.validateImagePath(refPath);
+          const refBytes = await fs.readFile(refPath);
+          parts.push({ inlineData: { data: refBytes.toString("base64"), mimeType: this.getMimeType(refPath) } });
+        } catch (err) {
+          log.warn("Reference image skipped in batch", { path: refPath, error: err instanceof Error ? err.message : String(err) });
+        }
+      }
+      parts.push({ text: prompt });
+      if (parts.length > 1) contents = { parts };
+    }
+
     const response = await this.withRetry(
       () => this.withTimeout(
-        this.genAI!.models.generateContent({ model: this.config!.model, contents: prompt }),
+        this.genAI!.models.generateContent({ model: this.config!.model, contents }),
         this.config!.timeoutMs,
         "generate_image"
       ),
@@ -805,14 +849,14 @@ export class NanoBananaMCP {
     }
   }
 
-  private async opGenerateImageBatch(args: { prompt: string; count?: number }): Promise<CallToolResult> {
+  private async opGenerateImageBatch(args: { prompt: string; count?: number; referenceImages?: string[] }): Promise<CallToolResult> {
     this.ensureConfigured();
 
     const count = Math.min(Math.max(args.count ?? 2, 1), CONSTANTS.BATCH_MAX_COUNT);
-    log.info("generate_image_batch starting", { count, model: this.config!.model });
+    log.info("generate_image_batch starting", { count, model: this.config!.model, referenceImages: args.referenceImages?.length ?? 0 });
 
     const results = await Promise.allSettled(
-      Array.from({ length: count }, () => this.generateImageCore(args.prompt))
+      Array.from({ length: count }, () => this.generateImageCore(args.prompt, args.referenceImages))
     );
 
     type CoreResult = { savedPaths: string[]; imageContent: McpImageContent[]; textContent: string; tokenUsage?: { total: number; prompt: number; response: number } };
@@ -1135,8 +1179,9 @@ export class NanoBananaMCP {
     }
   }
 
-  private async opListGeneratedImages(args: { limit?: number }): Promise<CallToolResult> {
+  private async opListGeneratedImages(args: { limit?: number; operation?: "generate" | "edit"; since?: string }): Promise<CallToolResult> {
     const limit = args.limit ?? 20;
+    const sinceDate = args.since ? new Date(args.since) : null;
     const imagesDir = this.getImagesDirectory();
 
     try {
@@ -1153,30 +1198,163 @@ export class NanoBananaMCP {
       .map(e => e.name)
       .sort((a, b) => b.localeCompare(a));
 
-    const sliced = imageFiles.slice(0, limit);
-
-    if (sliced.length === 0) {
-      return { content: [{ type: "text", text: `No images found in ${imagesDir}.` }] };
-    }
-
-    const details = await Promise.all(
-      sliced.map(async (name) => {
+    // Resolve stats + sidecars, then apply filters
+    const resolved = await Promise.all(
+      imageFiles.map(async (name) => {
         const fullPath = path.join(imagesDir, name);
         const stats = await fs.stat(fullPath);
-        const marker = fullPath === this.lastImagePath ? " ← last" : "";
         const sidecar = await this.readImageSidecar(fullPath);
-        const promptSnippet = sidecar?.prompt
-          ? `\n    prompt: "${sidecar.prompt.length > 60 ? sidecar.prompt.substring(0, 60) + "…" : sidecar.prompt}"`
-          : "";
-        return `- ${fullPath} (${Math.round(stats.size / 1024)} KB, ${stats.mtime.toLocaleString()})${marker}${promptSnippet}`;
+        return { fullPath, stats, sidecar };
       })
     );
 
-    const header = imageFiles.length > limit
-      ? `Showing ${sliced.length} of ${imageFiles.length} image(s) in ${imagesDir} (newest first):`
+    const filtered = resolved.filter(({ stats, sidecar }) => {
+      if (args.operation && sidecar?.operation !== args.operation) return false;
+      if (sinceDate) {
+        const ts = sidecar?.timestamp ? new Date(sidecar.timestamp) : stats.mtime;
+        if (ts < sinceDate) return false;
+      }
+      return true;
+    });
+
+    const sliced = filtered.slice(0, limit);
+
+    if (sliced.length === 0) {
+      const filterDesc = [
+        args.operation ? `operation="${args.operation}"` : "",
+        args.since ? `since=${args.since}` : "",
+      ].filter(Boolean).join(", ");
+      return { content: [{ type: "text", text: `No images found in ${imagesDir}${filterDesc ? ` matching filters (${filterDesc})` : ""}.` }] };
+    }
+
+    const details = sliced.map(({ fullPath, stats, sidecar }) => {
+      const marker = fullPath === this.lastImagePath ? " ← last" : "";
+      const promptSnippet = sidecar?.prompt
+        ? `\n    prompt: "${sidecar.prompt.length > 60 ? sidecar.prompt.substring(0, 60) + "…" : sidecar.prompt}"`
+        : "";
+      const opTag = sidecar?.operation ? ` [${sidecar.operation}]` : "";
+      return `- ${fullPath}${opTag} (${Math.round(stats.size / 1024)} KB, ${stats.mtime.toLocaleString()})${marker}${promptSnippet}`;
+    });
+
+    const totalCount = filtered.length;
+    const header = totalCount > limit
+      ? `Showing ${sliced.length} of ${totalCount} image(s) in ${imagesDir} (newest first):`
       : `Found ${sliced.length} image(s) in ${imagesDir}:`;
 
     return { content: [{ type: "text", text: `${header}\n\n${details.join("\n")}` }] };
+  }
+
+  private async opClearSession(): Promise<CallToolResult> {
+    const hadImage = this.lastImagePath !== null;
+    this.lastImagePath = null;
+    await this.saveSession();
+    return {
+      content: [{
+        type: "text",
+        text: hadImage
+          ? "Session cleared — continue_editing has no target.\n\nGenerate or edit a new image to set a new session target."
+          : "Session was already empty — nothing to clear.",
+      }],
+    };
+  }
+
+  private async opRevertToOriginal(args: { imagePath?: string }): Promise<CallToolResult> {
+    const targetPath = args.imagePath ? path.resolve(args.imagePath) : this.lastImagePath;
+    if (!targetPath) {
+      throw new McpError(ErrorCode.InvalidRequest,
+        "No imagePath provided and no session target is set. Provide an imagePath or generate an image first.");
+    }
+
+    const visited = new Set<string>();
+    let current = targetPath;
+    let root = targetPath;
+
+    while (!visited.has(current)) {
+      visited.add(current);
+      const sidecar = await this.readImageSidecar(current);
+      if (sidecar?.sourceImage) {
+        root = current;
+        current = path.resolve(sidecar.sourceImage);
+      } else {
+        root = current;
+        break;
+      }
+    }
+
+    if (root === targetPath) {
+      return {
+        content: [{
+          type: "text",
+          text: `"${targetPath}" is already the original — its sidecar has no sourceImage.`,
+        }],
+      };
+    }
+
+    try { await fs.access(root); } catch {
+      throw new McpError(ErrorCode.InvalidRequest,
+        `Original image not found at: ${root} — it may have been deleted.`);
+    }
+
+    this.lastImagePath = root;
+    await this.saveSession();
+
+    return {
+      content: [{
+        type: "text",
+        text: `Session target reverted to original:\n  ${root}\n\nUse continue_editing to start a fresh edit chain from this image.`,
+      }],
+    };
+  }
+
+  private async opExportImages(args: { outputDir: string; imagePaths?: string[] }): Promise<CallToolResult> {
+    const outputDir = path.resolve(args.outputDir);
+
+    let pathsToExport: string[];
+    if (args.imagePaths && args.imagePaths.length > 0) {
+      pathsToExport = args.imagePaths.map(p => path.resolve(p));
+    } else {
+      const imagesDir = this.getImagesDirectory();
+      try {
+        const entries = await fs.readdir(imagesDir, { withFileTypes: true });
+        pathsToExport = entries
+          .filter(e => e.isFile() && /\.(png|jpe?g|webp)$/i.test(e.name))
+          .map(e => path.join(imagesDir, e.name));
+      } catch {
+        throw new McpError(ErrorCode.InvalidRequest,
+          `Output directory not found: ${imagesDir}. Generate some images first.`);
+      }
+    }
+
+    if (pathsToExport.length === 0) {
+      return { content: [{ type: "text", text: "No images to export." }] };
+    }
+
+    await fs.mkdir(outputDir, { recursive: true, mode: 0o755 });
+
+    let copied = 0;
+    const skipped: string[] = [];
+
+    for (const src of pathsToExport) {
+      const dest = path.join(outputDir, path.basename(src));
+      try {
+        await fs.copyFile(src, dest);
+        copied++;
+        log.debug("Exported image", { src, dest });
+        try {
+          await fs.copyFile(this.sidecarPath(src), this.sidecarPath(dest));
+        } catch { /* no sidecar is fine */ }
+      } catch (err) {
+        skipped.push(path.basename(src));
+        log.warn("Export: failed to copy image", { src, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    const lines = [`Exported ${copied} image(s) to: ${outputDir}`];
+    if (skipped.length > 0) {
+      lines.push(`\n⚠️  Skipped ${skipped.length} unreadable image(s):\n${skipped.map(n => `- ${n}`).join("\n")}`);
+    }
+
+    return { content: [{ type: "text", text: lines.join("\n") }] };
   }
 
   private async opGetImageHistory(args: { imagePath: string }): Promise<CallToolResult> {
@@ -1241,7 +1419,7 @@ export class NanoBananaMCP {
   }
 
   public async run(): Promise<void> {
-    log.info("nano-banana-mcp v1.3.0 starting", { logLevel: log.levelName });
+    log.info("nano-banana-mcp v1.4.0 starting", { logLevel: log.levelName });
     await this.loadConfig();
     await this.loadSession();
     const transport = new StdioServerTransport();
